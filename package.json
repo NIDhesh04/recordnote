@@ -1,0 +1,24 @@
+{
+  "name": "recordnote",
+  "version": "1.0.0",
+  "description": "Chunked lecture & conversation audio transcription and exhaustive note-taking powered by Gemini Flash and FFmpeg",
+  "type": "module",
+  "main": "src/server.js",
+  "scripts": {
+    "start": "node src/server.js",
+    "dev": "node --watch src/server.js",
+    "cli": "node src/cli.js",
+    "test:pipeline": "node scripts/test-pipeline.js"
+  },
+  "keywords": [
+    "lecture-notes",
+    "transcription",
+    "gemini",
+    "ffmpeg",
+    "audio-chunking",
+    "recordnote"
+  ],
+  "engines": {
+    "node": ">=20.0.0"
+  }
+}

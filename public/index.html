@@ -1,0 +1,258 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>RecordNote — Chunked Lecture Transcription & Comprehensive Notes</title>
+  <link rel="stylesheet" href="/styles.css" />
+</head>
+<body>
+  <div class="app-shell">
+    <!-- Left Sidebar: Persistent Session Vault -->
+    <aside class="sidebar">
+      <div class="brand">
+        <div class="brand-icon">RN</div>
+        <div>
+          <h1>RecordNote</h1>
+          <span class="brand-sub">Chunked Verbatim &amp; Deep Notes</span>
+        </div>
+      </div>
+
+      <button id="newRecordingBtn" class="btn btn-primary btn-full">
+        + New Recording Import
+      </button>
+
+      <div class="sidebar-section-header">
+        <span>STORED SESSIONS VAULT</span>
+        <span id="sessionCountBadge" class="badge">0</span>
+      </div>
+
+      <div id="sessionList" class="session-list">
+        <!-- Populated dynamically -->
+      </div>
+
+      <div class="sidebar-footer">
+        <div class="tier-indicator">
+          <span class="dot dot-green"></span>
+          <span>Gemini Free Tier Active ($0 Cost)</span>
+        </div>
+      </div>
+    </aside>
+
+    <!-- Main Workspace -->
+    <main class="main-panel">
+      <!-- Top View 1: New Import Panel -->
+      <section id="importView" class="panel-view">
+        <div class="import-container">
+          <div class="import-header">
+            <h2>Import Lecture or Conversation Recording</h2>
+            <p>
+              Recordings are automatically normalized, sliced at natural speech pauses (~5-minute chunks), transcribed verbatim chunk-by-chunk with rolling context, stored permanently on disk, and compiled into exhaustive textbook-grade notes.
+            </p>
+          </div>
+
+          <!-- Import Source Switcher -->
+          <div class="source-tabs">
+            <button class="source-tab active" data-source="local">
+              <span class="tab-icon">💻</span>
+              <div>
+                <strong>Browse Computer</strong>
+                <small>Upload .mp3, .aac, .m4a, .wav, .ogg, .mp4</small>
+              </div>
+            </button>
+            <button class="source-tab" data-source="gdrive">
+              <span class="tab-icon">☁️</span>
+              <div>
+                <strong>Import from Google Drive</strong>
+                <small>Paste a shared Google Drive audio link or File ID</small>
+              </div>
+            </button>
+          </div>
+
+          <form id="importForm" class="import-form">
+            <!-- Local File Dropzone -->
+            <div id="localSourceBox" class="source-box">
+              <div id="dropZone" class="drop-zone">
+                <input
+                  type="file"
+                  id="audioFileInput"
+                  accept=".mp3,.aac,.m4a,.wav,.ogg,.flac,.webm,.mp4,audio/*,video/*"
+                  hidden
+                />
+                <div class="drop-icon">🎙️</div>
+                <p class="drop-title" id="dropTitle">
+                  Drag &amp; drop your <strong>.mp3</strong> or <strong>.aac</strong> lecture recording here
+                </p>
+                <p class="drop-sub" id="dropSub">
+                  Supports 40–45+ min recordings (.mp3, .aac, .m4a, .wav, .ogg, .flac, .webm, .mp4)
+                </p>
+                <button type="button" id="browseFileBtn" class="btn btn-secondary">
+                  Browse Computer Files
+                </button>
+              </div>
+            </div>
+
+            <!-- Google Drive Box -->
+            <div id="gdriveSourceBox" class="source-box hidden">
+              <div class="form-group">
+                <label for="gdriveUrlInput">Google Drive Share Link or File ID</label>
+                <input
+                  type="text"
+                  id="gdriveUrlInput"
+                  class="input"
+                  placeholder="https://drive.google.com/file/d/1A2B3C.../view?usp=sharing"
+                />
+                <small class="help-text">
+                  Ensure the file in Google Drive is shared as <strong>"Anyone with the link"</strong>. Works with large 45-min <code>.mp3</code> and <code>.aac</code> files automatically.
+                </small>
+              </div>
+            </div>
+
+            <!-- Shared Metadata Inputs -->
+            <div class="form-row">
+              <div class="form-group">
+                <label for="titleInput">Lecture / Recording Title</label>
+                <input
+                  type="text"
+                  id="titleInput"
+                  class="input"
+                  placeholder="e.g., CS301 Lecture 12 — Virtual Memory & Page Replacement"
+                />
+              </div>
+
+              <div class="form-group">
+                <label for="chunkSecSelect">Smart Chunk Window</label>
+                <select id="chunkSecSelect" class="input">
+                  <option value="300" selected>5 Minutes (Recommended for 40–45m lectures)</option>
+                  <option value="240">4 Minutes (High density / fast speech)</option>
+                  <option value="180">3 Minutes (Short segments)</option>
+                  <option value="360">6 Minutes (Fewer chunks)</option>
+                </select>
+              </div>
+            </div>
+
+            <div class="form-group">
+              <label for="topicInput">
+                Subject / Technical Context &amp; Keywords <span class="optional-tag">(Optional, boosts jargon accuracy)</span>
+              </label>
+              <input
+                type="text"
+                id="topicInput"
+                class="input"
+                placeholder="e.g., Operating Systems, TLB, Page Faults, Belady's Anomaly, LRU vs Clock Algorithm"
+              />
+            </div>
+
+            <div id="uploadProgressBarWrap" class="upload-progress-wrap hidden">
+              <div class="upload-progress-label" id="uploadProgressLabel">Uploading audio stream...</div>
+              <div class="progress-track">
+                <div id="uploadProgressFill" class="progress-fill" style="width: 0%"></div>
+              </div>
+            </div>
+
+            <div id="formErrorBox" class="alert alert-error hidden"></div>
+
+            <button type="submit" id="startPipelineBtn" class="btn btn-primary btn-lg btn-full">
+              Start Smart Chunking, Verbatim Transcription &amp; Comprehensive Notes
+            </button>
+          </form>
+        </div>
+      </section>
+
+      <!-- Top View 2: Active / Stored Session Detail View -->
+      <section id="sessionView" class="panel-view hidden">
+        <!-- Session Top Header -->
+        <header class="session-header">
+          <div class="session-title-group">
+            <div class="session-badges">
+              <span id="sessionStatusBadge" class="status-pill">Completed</span>
+              <span id="sessionSourceBadge" class="meta-pill">Local Audio</span>
+              <span id="sessionDurationBadge" class="meta-pill">00:00</span>
+            </div>
+            <h2 id="sessionTitleHeading">Lecture Title</h2>
+            <p id="sessionTopicSub" class="session-topic-sub"></p>
+          </div>
+
+          <div class="session-actions">
+            <button id="resumeSessionBtn" class="btn btn-secondary hidden">
+              ↻ Resume / Retry Pipeline
+            </button>
+            <button id="regenerateNotesBtn" class="btn btn-secondary">
+              ✦ Rebuild Comprehensive Notes
+            </button>
+            <button id="deleteSessionBtn" class="btn btn-danger-outline" title="Delete session">
+              Delete
+            </button>
+          </div>
+        </header>
+
+        <!-- Live Progress Banner -->
+        <div id="liveProgressBanner" class="live-banner">
+          <div class="live-banner-top">
+            <span id="liveStatusText" class="live-status-text">Ready</span>
+            <span id="liveStatsText" class="live-stats-text">0 Chunks | 0 Transcript Words | 0 Note Words</span>
+          </div>
+          <div class="progress-track">
+            <div id="liveProgressFill" class="progress-fill" style="width: 0%"></div>
+          </div>
+
+          <!-- Visual Chunk Pills Strip -->
+          <div id="chunkPillsStrip" class="chunk-pills-strip"></div>
+        </div>
+
+        <div id="sessionErrorBanner" class="alert alert-error hidden"></div>
+
+        <!-- Reader Navigation Bar -->
+        <div class="reader-toolbar">
+          <div class="reader-tabs">
+            <button class="reader-tab active" data-tab="notes">
+              📖 Comprehensive Lecture Notes
+              <span id="notesWordCountBadge" class="tab-count">0 words</span>
+            </button>
+            <button class="reader-tab" data-tab="transcript">
+              🎙️ Stored Verbatim Transcripts
+              <span id="transcriptWordCountBadge" class="tab-count">0 words</span>
+            </button>
+          </div>
+
+          <div class="reader-utilities">
+            <input
+              type="search"
+              id="readerSearchInput"
+              class="input input-sm"
+              placeholder="Search in transcript &amp; notes..."
+            />
+            <button id="copyCurrentTabBtn" class="btn btn-secondary btn-sm">
+              Copy Text
+            </button>
+            <a id="exportNotesBtn" class="btn btn-secondary btn-sm" href="#" download>
+              ⬇ Notes (.md)
+            </a>
+            <a id="exportTranscriptBtn" class="btn btn-secondary btn-sm" href="#" download>
+              ⬇ Transcript (.md)
+            </a>
+          </div>
+        </div>
+
+        <!-- Tab 1: Exhaustive Comprehensive Notes -->
+        <div id="notesTabPane" class="reader-pane">
+          <div id="notesEmptyState" class="empty-state hidden">
+            <h3>Comprehensive Notes Are Being Compiled...</h3>
+            <p>
+              As soon as the verbatim audio chunks finish transcribing, RecordNote compiles exhaustive, section-by-section textbook-grade notes detailing every concept, explanation, example, formula, and Q&amp;A discussed.
+            </p>
+          </div>
+          <article id="notesMarkdownContainer" class="markdown-body"></article>
+        </div>
+
+        <!-- Tab 2: Stored Chunk-by-Chunk Verbatim Transcripts -->
+        <div id="transcriptTabPane" class="reader-pane hidden">
+          <div id="transcriptChunksContainer" class="transcript-chunks-list"></div>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <script src="/app.js" type="module"></script>
+</body>
+</html>
