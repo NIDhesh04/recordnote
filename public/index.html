@@ -3,18 +3,18 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>RecordNote — Chunked Lecture Transcription & Comprehensive Notes</title>
+  <title>RecordNote — PostgreSQL Lecture Transcription &amp; Comprehensive Notes</title>
   <link rel="stylesheet" href="/styles.css" />
 </head>
 <body>
   <div class="app-shell">
-    <!-- Left Sidebar: Persistent Session Vault -->
+    <!-- Left Sidebar: PostgreSQL Lecture Vault -->
     <aside class="sidebar">
       <div class="brand">
         <div class="brand-icon">RN</div>
         <div>
           <h1>RecordNote</h1>
-          <span class="brand-sub">Chunked Verbatim &amp; Deep Notes</span>
+          <span class="brand-sub">PostgreSQL Knowledge Base</span>
         </div>
       </div>
 
@@ -22,19 +22,27 @@
         + New Recording Import
       </button>
 
+      <!-- Subject Filter in Sidebar -->
+      <div class="sidebar-filter-wrap">
+        <label for="sidebarSubjectFilter" class="sidebar-filter-label">FILTER BY SUBJECT</label>
+        <select id="sidebarSubjectFilter" class="input input-sidebar-select">
+          <option value="all">All Subjects</option>
+        </select>
+      </div>
+
       <div class="sidebar-section-header">
-        <span>STORED SESSIONS VAULT</span>
+        <span>STORED LECTURES (POSTGRES)</span>
         <span id="sessionCountBadge" class="badge">0</span>
       </div>
 
       <div id="sessionList" class="session-list">
-        <!-- Populated dynamically -->
+        <!-- Populated dynamically from PostgreSQL -->
       </div>
 
       <div class="sidebar-footer">
         <div class="tier-indicator">
           <span class="dot dot-green"></span>
-          <span>Gemini Free Tier Active ($0 Cost)</span>
+          <span>PostgreSQL Connected • Paid Tier Fast Mode</span>
         </div>
       </div>
     </aside>
@@ -47,20 +55,20 @@
           <div class="import-header">
             <h2>Import Lecture or Conversation Recording</h2>
             <p>
-              Recordings are automatically normalized, sliced at natural speech pauses (~5-minute chunks), transcribed verbatim chunk-by-chunk with rolling context, stored permanently on disk, and compiled into exhaustive textbook-grade notes.
+              Select an existing subject from PostgreSQL (or create a new one). Your recording will be assigned a sequential ID (e.g. <code>GT-L01</code>), sliced at natural speech pauses, transcribed verbatim into <code>transcript_chunks</code>, and compiled into exhaustive notes in <code>lecture_notes</code>.
             </p>
           </div>
 
           <!-- Import Source Switcher -->
           <div class="source-tabs">
-            <button class="source-tab active" data-source="local">
+            <button class="source-tab active" data-source="local" type="button">
               <span class="tab-icon">💻</span>
               <div>
                 <strong>Browse Computer</strong>
                 <small>Upload .mp3, .aac, .m4a, .wav, .ogg, .mp4</small>
               </div>
             </button>
-            <button class="source-tab" data-source="gdrive">
+            <button class="source-tab" data-source="gdrive" type="button">
               <span class="tab-icon">☁️</span>
               <div>
                 <strong>Import from Google Drive</strong>
@@ -108,16 +116,13 @@
               </div>
             </div>
 
-            <!-- Shared Metadata Inputs -->
+            <!-- Subject Dropdown Selector (PostgreSQL `subjects` table) -->
             <div class="form-row">
               <div class="form-group">
-                <label for="titleInput">Lecture / Recording Title</label>
-                <input
-                  type="text"
-                  id="titleInput"
-                  class="input"
-                  placeholder="e.g., CS301 Lecture 12 — Virtual Memory & Page Replacement"
-                />
+                <label for="subjectSelect">Course Subject (Database)</label>
+                <select id="subjectSelect" class="input">
+                  <!-- Populated from /api/subjects + "+ Create New Subject..." -->
+                </select>
               </div>
 
               <div class="form-group">
@@ -131,15 +136,101 @@
               </div>
             </div>
 
+            <!-- Inline New Subject Creator (shown when "+ Create New Subject..." is selected) -->
+            <div id="newSubjectFieldsBox" class="new-subject-box hidden">
+              <div class="form-row">
+                <div class="form-group">
+                  <label for="newSubjectNameInput">New Subject Name</label>
+                  <input
+                    type="text"
+                    id="newSubjectNameInput"
+                    class="input"
+                    placeholder="e.g., Discrete Mathematics, Operating Systems, Linear Algebra"
+                  />
+                </div>
+                <div class="form-group">
+                  <label for="newSubjectCodeInput">Subject ID Prefix <span class="optional-tag">(Auto-filled)</span></label>
+                  <input
+                    type="text"
+                    id="newSubjectCodeInput"
+                    class="input"
+                    maxlength="8"
+                    placeholder="e.g., DM, OS, LA"
+                  />
+                </div>
+              </div>
+              <small class="help-text">
+                This will create a new subject in PostgreSQL and assign the first lecture ID as <code>&lt;PREFIX&gt;-L01</code>.
+              </small>
+            </div>
+
+            <!-- Selective Audio Timestamp Range (Trim Start / End) -->
+            <div class="trim-section-box">
+              <div class="trim-section-header">
+                <div>
+                  <strong>✂️ Recording Time Range (Optional Trim)</strong>
+                  <small>Leave blank to process the full recording, or specify Start &amp; End timestamps so ONLY that portion is stored and processed (the rest is permanently discarded).</small>
+                </div>
+              </div>
+
+              <!-- Interactive Local Audio Preview Player (revealed when a local file is selected) -->
+              <div id="localAudioPreviewWrap" class="audio-preview-wrap hidden">
+                <audio id="localAudioPreview" controls preload="metadata"></audio>
+                <div class="audio-preview-actions">
+                  <button type="button" id="setStartFromPlayerBtn" class="btn btn-secondary btn-sm">
+                    ⏱ Set Current Time as Start
+                  </button>
+                  <button type="button" id="setEndFromPlayerBtn" class="btn btn-secondary btn-sm">
+                    ⏱ Set Current Time as End
+                  </button>
+                  <button type="button" id="clearTrimBtn" class="btn btn-secondary btn-sm">
+                    Reset to Full Recording
+                  </button>
+                </div>
+              </div>
+
+              <div class="form-row trim-inputs-row">
+                <div class="form-group" style="margin-bottom: 0;">
+                  <label for="trimStartInput">Start Timestamp <span class="optional-tag">(MM:SS or HH:MM:SS)</span></label>
+                  <input
+                    type="text"
+                    id="trimStartInput"
+                    class="input"
+                    placeholder="00:00 (Start of recording)"
+                  />
+                </div>
+                <div class="form-group" style="margin-bottom: 0;">
+                  <label for="trimEndInput">End Timestamp <span class="optional-tag">(MM:SS or HH:MM:SS)</span></label>
+                  <input
+                    type="text"
+                    id="trimEndInput"
+                    class="input"
+                    placeholder="End of recording (e.g., 35:00)"
+                  />
+                </div>
+              </div>
+            </div>
+
+            <!-- Lecture Title & Specific Topic Inputs -->
+            <div class="form-group">
+              <label for="titleInput">Lecture / Recording Title <span class="optional-tag">(Auto-numbered if left blank)</span></label>
+              <input
+                type="text"
+                id="titleInput"
+                class="input"
+                placeholder="e.g., Trees, Spanning Trees &amp; Cayley's Formula"
+              />
+            </div>
+
             <div class="form-group">
               <label for="topicInput">
-                Subject / Technical Context &amp; Keywords <span class="optional-tag">(Optional, boosts jargon accuracy)</span>
+                Specific Sub-Topics / Technical Keywords <span class="optional-tag">(Optional, boosts jargon spelling)</span>
               </label>
               <input
                 type="text"
                 id="topicInput"
                 class="input"
-                placeholder="e.g., Operating Systems, TLB, Page Faults, Belady's Anomaly, LRU vs Clock Algorithm"
+                placeholder="e.g., Prüfer sequences, Kruskal's algorithm, Bipartite graphs, Handshaking lemma"
               />
             </div>
 
@@ -153,7 +244,7 @@
             <div id="formErrorBox" class="alert alert-error hidden"></div>
 
             <button type="submit" id="startPipelineBtn" class="btn btn-primary btn-lg btn-full">
-              Start Smart Chunking, Verbatim Transcription &amp; Comprehensive Notes
+              Create Lecture in PostgreSQL &amp; Start Transcription Pipeline
             </button>
           </form>
         </div>
@@ -165,6 +256,8 @@
         <header class="session-header">
           <div class="session-title-group">
             <div class="session-badges">
+              <span id="sessionCodeBadge" class="code-pill">GT-L01</span>
+              <span id="sessionSubjectBadge" class="subject-pill">Graph Theory</span>
               <span id="sessionStatusBadge" class="status-pill">Completed</span>
               <span id="sessionSourceBadge" class="meta-pill">Local Audio</span>
               <span id="sessionDurationBadge" class="meta-pill">00:00</span>
@@ -180,7 +273,7 @@
             <button id="regenerateNotesBtn" class="btn btn-secondary">
               ✦ Rebuild Comprehensive Notes
             </button>
-            <button id="deleteSessionBtn" class="btn btn-danger-outline" title="Delete session">
+            <button id="deleteSessionBtn" class="btn btn-danger-outline" title="Delete lecture from PostgreSQL">
               Delete
             </button>
           </div>
@@ -201,6 +294,21 @@
         </div>
 
         <div id="sessionErrorBanner" class="alert alert-error hidden"></div>
+
+        <!-- Banner shown when a chunk transcript is re-extracted or edited -->
+        <div id="notesSyncBanner" class="notes-sync-banner hidden">
+          <span id="notesSyncBannerText">
+            ⚠️ A chunk transcript was updated in PostgreSQL. Would you like to update the structured lecture notes?
+          </span>
+          <div style="display: flex; gap: 8px;">
+            <button id="smartUpdateNotesBtn" class="btn btn-primary btn-sm">
+              ⚡ Update Notes From Modified Chunk Onward
+            </button>
+            <button id="fullRebuildNotesBannerBtn" class="btn btn-secondary btn-sm">
+              ✦ Full Rebuild All Notes
+            </button>
+          </div>
+        </div>
 
         <!-- Reader Navigation Bar -->
         <div class="reader-toolbar">
@@ -237,9 +345,9 @@
         <!-- Tab 1: Exhaustive Comprehensive Notes -->
         <div id="notesTabPane" class="reader-pane">
           <div id="notesEmptyState" class="empty-state hidden">
-            <h3>Comprehensive Notes Are Being Compiled...</h3>
+            <h3>Comprehensive Notes Are Being Compiled into PostgreSQL...</h3>
             <p>
-              As soon as the verbatim audio chunks finish transcribing, RecordNote compiles exhaustive, section-by-section textbook-grade notes detailing every concept, explanation, example, formula, and Q&amp;A discussed.
+              As soon as the verbatim audio chunks finish transcribing into <code>transcript_chunks</code>, RecordNote compiles exhaustive, section-by-section textbook-grade notes into <code>lecture_notes</code>.
             </p>
           </div>
           <article id="notesMarkdownContainer" class="markdown-body"></article>

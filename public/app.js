@@ -1,12 +1,20 @@
+import { escapeHtml, deriveClientSubjectCode, formatClientTime } from './js/utils.js';
+import { renderMarkdown } from './js/markdown.js';
+import { uploadFileWithProgress, createGdriveSession } from './js/api.js';
+import { renderTranscriptChunks } from './js/transcript-view.js';
+
 let currentSourceMode = 'local';
 let selectedLocalFile = null;
 let currentSessionId = null;
 let currentSessionData = null;
 let currentReaderTab = 'notes';
 let activeEventSource = null;
+let cachedSubjects = [];
+let lastModifiedChunkIndex = null;
 
 // DOM Elements
 const newRecordingBtn = document.getElementById('newRecordingBtn');
+const sidebarSubjectFilter = document.getElementById('sidebarSubjectFilter');
 const sessionCountBadge = document.getElementById('sessionCountBadge');
 const sessionListEl = document.getElementById('sessionList');
 
@@ -23,10 +31,22 @@ const browseFileBtn = document.getElementById('browseFileBtn');
 const dropTitle = document.getElementById('dropTitle');
 const dropSub = document.getElementById('dropSub');
 
+const subjectSelect = document.getElementById('subjectSelect');
+const newSubjectFieldsBox = document.getElementById('newSubjectFieldsBox');
+const newSubjectNameInput = document.getElementById('newSubjectNameInput');
+const newSubjectCodeInput = document.getElementById('newSubjectCodeInput');
+
 const gdriveUrlInput = document.getElementById('gdriveUrlInput');
 const titleInput = document.getElementById('titleInput');
 const topicInput = document.getElementById('topicInput');
 const chunkSecSelect = document.getElementById('chunkSecSelect');
+const trimStartInput = document.getElementById('trimStartInput');
+const trimEndInput = document.getElementById('trimEndInput');
+const localAudioPreviewWrap = document.getElementById('localAudioPreviewWrap');
+const localAudioPreview = document.getElementById('localAudioPreview');
+const setStartFromPlayerBtn = document.getElementById('setStartFromPlayerBtn');
+const setEndFromPlayerBtn = document.getElementById('setEndFromPlayerBtn');
+const clearTrimBtn = document.getElementById('clearTrimBtn');
 const importForm = document.getElementById('importForm');
 const startPipelineBtn = document.getElementById('startPipelineBtn');
 const uploadProgressBarWrap = document.getElementById('uploadProgressBarWrap');
@@ -35,6 +55,8 @@ const uploadProgressFill = document.getElementById('uploadProgressFill');
 const formErrorBox = document.getElementById('formErrorBox');
 
 // Session Detail DOM
+const sessionCodeBadge = document.getElementById('sessionCodeBadge');
+const sessionSubjectBadge = document.getElementById('sessionSubjectBadge');
 const sessionStatusBadge = document.getElementById('sessionStatusBadge');
 const sessionSourceBadge = document.getElementById('sessionSourceBadge');
 const sessionDurationBadge = document.getElementById('sessionDurationBadge');
@@ -49,6 +71,10 @@ const liveStatsText = document.getElementById('liveStatsText');
 const liveProgressFill = document.getElementById('liveProgressFill');
 const chunkPillsStrip = document.getElementById('chunkPillsStrip');
 const sessionErrorBanner = document.getElementById('sessionErrorBanner');
+const notesSyncBanner = document.getElementById('notesSyncBanner');
+const notesSyncBannerText = document.getElementById('notesSyncBannerText');
+const smartUpdateNotesBtn = document.getElementById('smartUpdateNotesBtn');
+const fullRebuildNotesBannerBtn = document.getElementById('fullRebuildNotesBannerBtn');
 
 const readerTabs = document.querySelectorAll('.reader-tab');
 const notesWordCountBadge = document.getElementById('notesWordCountBadge');
@@ -64,151 +90,81 @@ const notesMarkdownContainer = document.getElementById('notesMarkdownContainer')
 const transcriptTabPane = document.getElementById('transcriptTabPane');
 const transcriptChunksContainer = document.getElementById('transcriptChunksContainer');
 
-function escapeHtml(str) {
-  return String(str || '')
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;');
-}
+// ============================================================================
+// SUBJECTS DROPDOWN & FILTER
+// ============================================================================
 
-/**
- * Clean, dependency-free Markdown to HTML renderer tailored for comprehensive lecture notes.
- */
-function renderMarkdown(md) {
-  if (!md || !md.trim()) return '';
+async function loadSubjects(selectedSubjectId = '') {
+  try {
+    const res = await fetch('/api/subjects');
+    const data = await res.json();
+    cachedSubjects = data.subjects || [];
 
-  // Extract fenced code blocks first
-  const codeBlocks = [];
-  let text = md.replace(/```([a-zA-Z0-9_-]*)\r?\n([\s\S]*?)```/g, (_, lang, code) => {
-    const idx = codeBlocks.length;
-    codeBlocks.push(`<pre><code class="lang-${escapeHtml(lang)}">${escapeHtml(code.trimEnd())}</code></pre>`);
-    return `@@CODEBLOCK_${idx}@@`;
-  });
+    const currentVal = selectedSubjectId || subjectSelect.value;
+    subjectSelect.innerHTML =
+      cachedSubjects
+        .map(
+          (s) =>
+            `<option value="${escapeHtml(s.id)}">${escapeHtml(s.name)} (${escapeHtml(s.code)}) — ${
+              s.lectureCount || 0
+            } lectures</option>`
+        )
+        .join('') + `<option value="__new__">+ Create New Subject in Database...</option>`;
 
-  const lines = text.split(/\r?\n/);
-  const out = [];
-  let inList = false;
-  let listType = 'ul';
-
-  const closeList = () => {
-    if (inList) {
-      out.push(`</${listType}>`);
-      inList = false;
-    }
-  };
-
-  const formatInline = (line) => {
-    let s = escapeHtml(line);
-    // Inline code
-    s = s.replace(/`([^`]+)`/g, '<code>$1</code>');
-    // Bold
-    s = s.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
-    // Italic
-    s = s.replace(/\*([^*]+)\*/g, '<em>$1</em>');
-    // Timestamp badges [00:12] or [01:12:04]
-    s = s.replace(/\[(\d{2}:\d{2}(?::\d{2})?)\]/g, '<code class="ts-badge">[$1]</code>');
-    return s;
-  };
-
-  for (let raw of lines) {
-    const trimmed = raw.trim();
-
-    if (/^@@CODEBLOCK_(\d+)@@$/.test(trimmed)) {
-      closeList();
-      const idx = Number(trimmed.match(/^@@CODEBLOCK_(\d+)@@$/)[1]);
-      out.push(codeBlocks[idx]);
-      continue;
+    if (currentVal && currentVal !== '__new__' && cachedSubjects.some((s) => s.id === currentVal)) {
+      subjectSelect.value = currentVal;
+    } else if (cachedSubjects.length > 0) {
+      subjectSelect.value = cachedSubjects[0].id;
     }
 
-    if (!trimmed) {
-      closeList();
-      continue;
-    }
+    newSubjectFieldsBox.classList.toggle('hidden', subjectSelect.value !== '__new__');
 
-    if (/^---+$/.test(trimmed)) {
-      closeList();
-      out.push('<hr />');
-      continue;
-    }
+    const filterVal = sidebarSubjectFilter.value || 'all';
+    sidebarSubjectFilter.innerHTML =
+      `<option value="all">All Subjects</option>` +
+      cachedSubjects
+        .map(
+          (s) =>
+            `<option value="${escapeHtml(s.id)}">${escapeHtml(s.name)} (${escapeHtml(s.code)})</option>`
+        )
+        .join('');
 
-    if (trimmed.startsWith('#### ')) {
-      closeList();
-      out.push(`<h4>${formatInline(trimmed.slice(5))}</h4>`);
-      continue;
+    if (filterVal === 'all' || cachedSubjects.some((s) => s.id === filterVal)) {
+      sidebarSubjectFilter.value = filterVal;
     }
-    if (trimmed.startsWith('### ')) {
-      closeList();
-      out.push(`<h3>${formatInline(trimmed.slice(4))}</h3>`);
-      continue;
-    }
-    if (trimmed.startsWith('## ')) {
-      closeList();
-      out.push(`<h2>${formatInline(trimmed.slice(3))}</h2>`);
-      continue;
-    }
-    if (trimmed.startsWith('# ')) {
-      closeList();
-      out.push(`<h1>${formatInline(trimmed.slice(2))}</h1>`);
-      continue;
-    }
-
-    if (trimmed.startsWith('> ')) {
-      closeList();
-      const quoteBody = trimmed.slice(2).replace(/^\[!(IMPORTANT|NOTE|TIP|WARNING)\]\s*/i, '<strong>$1:</strong> ');
-      out.push(`<blockquote>${formatInline(quoteBody)}</blockquote>`);
-      continue;
-    }
-
-    const ulMatch = raw.match(/^\s*[-*]\s+(.+)$/);
-    if (ulMatch) {
-      if (!inList || listType !== 'ul') {
-        closeList();
-        out.push('<ul>');
-        inList = true;
-        listType = 'ul';
-      }
-      out.push(`<li>${formatInline(ulMatch[1])}</li>`);
-      continue;
-    }
-
-    const olMatch = raw.match(/^\s*\d+\.\s+(.+)$/);
-    if (olMatch) {
-      if (!inList || listType !== 'ol') {
-        closeList();
-        out.push('<ol>');
-        inList = true;
-        listType = 'ol';
-      }
-      out.push(`<li>${formatInline(olMatch[1])}</li>`);
-      continue;
-    }
-
-    closeList();
-    out.push(`<p>${formatInline(trimmed)}</p>`);
+  } catch (err) {
+    console.error('Failed to load subjects from PostgreSQL:', err);
   }
-
-  closeList();
-  return out.join('\n');
 }
 
-// Switch between Local Upload and Google Drive Import
+subjectSelect.addEventListener('change', () => {
+  const isNew = subjectSelect.value === '__new__';
+  newSubjectFieldsBox.classList.toggle('hidden', !isNew);
+  if (isNew) newSubjectNameInput.focus();
+});
+
+newSubjectNameInput.addEventListener('input', () => {
+  newSubjectCodeInput.value = deriveClientSubjectCode(newSubjectNameInput.value);
+});
+
+sidebarSubjectFilter.addEventListener('change', () => {
+  refreshSessionsList();
+});
+
+// ============================================================================
+// IMPORT FORM & AUDIO TRIM CONTROLS
+// ============================================================================
+
 sourceTabs.forEach((btn) => {
   btn.addEventListener('click', () => {
     sourceTabs.forEach((b) => b.classList.remove('active'));
     btn.classList.add('active');
     currentSourceMode = btn.dataset.source;
-    if (currentSourceMode === 'local') {
-      localSourceBox.classList.remove('hidden');
-      gdriveSourceBox.classList.add('hidden');
-    } else {
-      localSourceBox.classList.add('hidden');
-      gdriveSourceBox.classList.remove('hidden');
-    }
+    localSourceBox.classList.toggle('hidden', currentSourceMode !== 'local');
+    gdriveSourceBox.classList.toggle('hidden', currentSourceMode === 'local');
   });
 });
 
-// File Selection & Drag-and-Drop
 browseFileBtn.addEventListener('click', () => audioFileInput.click());
 dropZone.addEventListener('click', (e) => {
   if (e.target !== browseFileBtn) audioFileInput.click();
@@ -241,13 +197,34 @@ function selectLocalFile(file) {
   selectedLocalFile = file;
   const mb = (file.size / (1024 * 1024)).toFixed(2);
   dropTitle.innerHTML = `Selected: <strong>${escapeHtml(file.name)}</strong> (${mb} MB)`;
-  dropSub.textContent = 'Ready to normalize, smart-chunk, and transcribe verbatim.';
+  dropSub.textContent = 'Ready to normalize, smart-chunk, and transcribe into PostgreSQL.';
   if (!titleInput.value.trim()) {
     titleInput.value = file.name.replace(/\.[^/.]+$/, '').replace(/[_-]+/g, ' ');
   }
+
+  try {
+    localAudioPreview.src = URL.createObjectURL(file);
+    localAudioPreviewWrap.classList.remove('hidden');
+  } catch {
+    localAudioPreviewWrap.classList.add('hidden');
+  }
 }
 
-// Show Import View
+setStartFromPlayerBtn.addEventListener('click', () => {
+  trimStartInput.value = formatClientTime(localAudioPreview.currentTime || 0);
+});
+
+setEndFromPlayerBtn.addEventListener('click', () => {
+  if (localAudioPreview.currentTime > 0) {
+    trimEndInput.value = formatClientTime(localAudioPreview.currentTime);
+  }
+});
+
+clearTrimBtn.addEventListener('click', () => {
+  trimStartInput.value = '';
+  trimEndInput.value = '';
+});
+
 newRecordingBtn.addEventListener('click', () => {
   if (activeEventSource) {
     activeEventSource.close();
@@ -259,14 +236,30 @@ newRecordingBtn.addEventListener('click', () => {
   renderSidebarHighlight();
 });
 
-// Submit Import Form
+function showFormError(msg) {
+  formErrorBox.textContent = msg;
+  formErrorBox.classList.remove('hidden');
+}
+
 importForm.addEventListener('submit', async (e) => {
   e.preventDefault();
   formErrorBox.classList.add('hidden');
 
+  const isCreatingNewSubject = subjectSelect.value === '__new__';
+  const subjectId = isCreatingNewSubject ? '' : subjectSelect.value;
+  const newSubjectName = isCreatingNewSubject ? newSubjectNameInput.value.trim() : '';
+  const newSubjectCode = isCreatingNewSubject ? newSubjectCodeInput.value.trim() : '';
+
+  if (isCreatingNewSubject && !newSubjectName) {
+    showFormError('Please enter a name for the new subject (e.g., Combinatorics or Operating Systems).');
+    return;
+  }
+
   const title = titleInput.value.trim();
   const topic = topicInput.value.trim();
   const chunkTargetSec = Number(chunkSecSelect.value || 300);
+  const trimStart = trimStartInput.value.trim();
+  const trimEnd = trimEndInput.value.trim();
 
   if (currentSourceMode === 'local') {
     if (!selectedLocalFile) {
@@ -280,13 +273,19 @@ importForm.addEventListener('submit', async (e) => {
     uploadProgressLabel.textContent = `Uploading ${selectedLocalFile.name}...`;
 
     try {
-      const created = await uploadFileWithProgress(selectedLocalFile, {
-        title,
-        topic,
-        chunkTargetSec
-      });
+      const created = await uploadFileWithProgress(
+        selectedLocalFile,
+        { subjectId, newSubjectName, newSubjectCode, title, topic, chunkTargetSec, trimStart, trimEnd },
+        (pct) => {
+          uploadProgressFill.style.width = `${pct}%`;
+          uploadProgressLabel.textContent = `Uploading ${selectedLocalFile.name} (${pct}%)...`;
+        }
+      );
       uploadProgressBarWrap.classList.add('hidden');
       startPipelineBtn.disabled = false;
+      newSubjectNameInput.value = '';
+      newSubjectCodeInput.value = '';
+      await loadSubjects(created.session.subjectId);
       await refreshSessionsList();
       await openSession(created.session.id);
     } catch (err) {
@@ -303,14 +302,21 @@ importForm.addEventListener('submit', async (e) => {
 
     startPipelineBtn.disabled = true;
     try {
-      const res = await fetch('/api/sessions/gdrive', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ gdriveUrl, title, topic, chunkTargetSec })
+      const data = await createGdriveSession({
+        subjectId,
+        newSubjectName,
+        newSubjectCode,
+        gdriveUrl,
+        title,
+        topic,
+        chunkTargetSec,
+        trimStart,
+        trimEnd
       });
-      const data = await res.json();
-      if (!res.ok) throw new Error(data.error || 'Failed to start Google Drive import.');
       startPipelineBtn.disabled = false;
+      newSubjectNameInput.value = '';
+      newSubjectCodeInput.value = '';
+      await loadSubjects(data.session.subjectId);
       await refreshSessionsList();
       await openSession(data.session.id);
     } catch (err) {
@@ -320,56 +326,20 @@ importForm.addEventListener('submit', async (e) => {
   }
 });
 
-function showFormError(msg) {
-  formErrorBox.textContent = msg;
-  formErrorBox.classList.remove('hidden');
-}
+// ============================================================================
+// SIDEBAR VAULT & SESSION DETAIL VIEW
+// ============================================================================
 
-function uploadFileWithProgress(file, { title, topic, chunkTargetSec }) {
-  return new Promise((resolve, reject) => {
-    const xhr = new XMLHttpRequest();
-    xhr.open('POST', '/api/sessions/upload', true);
-    xhr.setRequestHeader('X-File-Name', encodeURIComponent(file.name));
-    xhr.setRequestHeader('X-Title', encodeURIComponent(title || file.name));
-    xhr.setRequestHeader('X-Topic', encodeURIComponent(topic || ''));
-    xhr.setRequestHeader('X-Chunk-Sec', String(chunkTargetSec || 300));
-
-    xhr.upload.onprogress = (ev) => {
-      if (ev.lengthComputable) {
-        const pct = Math.round((ev.loaded / ev.total) * 100);
-        uploadProgressFill.style.width = `${pct}%`;
-        uploadProgressLabel.textContent = `Uploading ${file.name} (${pct}%)...`;
-      }
-    };
-
-    xhr.onload = () => {
-      try {
-        const body = JSON.parse(xhr.responseText || '{}');
-        if (xhr.status >= 200 && xhr.status < 300) {
-          resolve(body);
-        } else {
-          reject(new Error(body.error || `Upload failed with status ${xhr.status}`));
-        }
-      } catch (err) {
-        reject(err);
-      }
-    };
-
-    xhr.onerror = () => reject(new Error('Network error during file upload'));
-    xhr.send(file);
-  });
-}
-
-// Fetch and render sidebar sessions list
 async function refreshSessionsList() {
   try {
-    const res = await fetch('/api/sessions');
+    const filterSubject = sidebarSubjectFilter.value || 'all';
+    const res = await fetch(`/api/sessions?subjectId=${encodeURIComponent(filterSubject)}`);
     const data = await res.json();
     const sessions = data.sessions || [];
     sessionCountBadge.textContent = String(sessions.length);
 
     if (sessions.length === 0) {
-      sessionListEl.innerHTML = `<div class="help-text" style="padding: 12px 6px;">No recordings stored yet. Import an .mp3, .aac, or Google Drive link to begin.</div>`;
+      sessionListEl.innerHTML = `<div class="help-text" style="padding: 12px 6px;">No lectures stored for this subject filter yet.</div>`;
       return;
     }
 
@@ -385,9 +355,11 @@ async function refreshSessionsList() {
             : '⟳ Running';
         return `
           <div class="session-item ${isActive}" data-id="${escapeHtml(s.id)}">
-            <div class="session-item-title">${escapeHtml(s.title)}</div>
+            <div class="session-item-title">
+              <span class="sidebar-code-tag">${escapeHtml(s.code)}</span>${escapeHtml(s.title)}
+            </div>
             <div class="session-item-meta">
-              <span>${dur} • ${s.completedChunks}/${s.totalChunks || '?'} chunks</span>
+              <span>${escapeHtml(s.subjectName)} • ${dur} • ${s.completedChunks}/${s.totalChunks || '?'} chunks</span>
               <span>${statusLabel}</span>
             </div>
           </div>
@@ -396,12 +368,10 @@ async function refreshSessionsList() {
       .join('');
 
     sessionListEl.querySelectorAll('.session-item').forEach((item) => {
-      item.addEventListener('click', () => {
-        openSession(item.dataset.id);
-      });
+      item.addEventListener('click', () => openSession(item.dataset.id));
     });
   } catch (err) {
-    console.error('Failed to load sessions list:', err);
+    console.error('Failed to load lectures list:', err);
   }
 }
 
@@ -411,7 +381,6 @@ function renderSidebarHighlight() {
   });
 }
 
-// Open a session detail view & subscribe to live SSE updates
 async function openSession(sessionId) {
   currentSessionId = sessionId;
   renderSidebarHighlight();
@@ -450,13 +419,23 @@ function connectSessionEventStream(sessionId) {
         data.type === 'chunks_ready' ||
         data.type === 'chunk_started' ||
         data.type === 'chunk_completed' ||
+        data.type === 'chunk_reprocessed' ||
         data.type === 'note_section_started' ||
         data.type === 'note_section_completed' ||
         data.type === 'session_completed' ||
         data.type === 'error'
       ) {
+        if (data.type === 'chunk_reprocessed' && lastModifiedChunkIndex !== null) {
+          notesSyncBannerText.textContent = `✓ ${data.chunkCode || 'Chunk'} was re-extracted and saved in PostgreSQL! Ready to update the structured lecture notes:`;
+          notesSyncBanner.classList.remove('hidden');
+        }
+        if (data.type === 'session_completed') {
+          lastModifiedChunkIndex = null;
+          notesSyncBanner.classList.add('hidden');
+        }
         await fetchAndRenderSessionDetails(sessionId);
         await refreshSessionsList();
+        await loadSubjects();
       }
     } catch (e) {
       console.error('SSE parse error:', e);
@@ -465,20 +444,23 @@ function connectSessionEventStream(sessionId) {
 }
 
 function renderSessionUI(payload) {
-  const { session, isRunning, fullTranscriptMarkdown, comprehensiveNotesMarkdown } = payload;
+  const { session, isRunning, comprehensiveNotesMarkdown } = payload;
 
+  sessionCodeBadge.textContent = session.code;
+  sessionSubjectBadge.textContent = `${session.subjectName} (${session.subjectCode})`;
   sessionTitleHeading.textContent = session.title;
-  sessionTopicSub.textContent = session.topic ? `Topic Context: ${session.topic}` : `Session ID: ${session.id}`;
+  sessionTopicSub.textContent = session.topic
+    ? `Topic Context: ${session.topic} • PostgreSQL ID: ${session.id}`
+    : `Lecture Code: ${session.code} • PostgreSQL ID: ${session.id}`;
 
   sessionSourceBadge.textContent =
     session.sourceType === 'gdrive' ? '☁️ Google Drive' : `💻 ${session.originalFileName || 'Local Audio'}`;
   sessionDurationBadge.textContent = session.audioMetadata?.durationFormatted || 'Processing...';
 
-  // Status badge
   sessionStatusBadge.className = 'status-pill';
   if (session.status === 'completed') {
     sessionStatusBadge.classList.add('completed');
-    sessionStatusBadge.textContent = 'Completed & Stored';
+    sessionStatusBadge.textContent = 'Stored in PostgreSQL';
   } else if (session.status === 'error') {
     sessionStatusBadge.classList.add('error');
     sessionStatusBadge.textContent = 'Interrupted / Error';
@@ -487,21 +469,15 @@ function renderSessionUI(payload) {
     sessionStatusBadge.textContent = session.status.replace('_', ' ');
   }
 
-  // Error banner & Resume button
   if (session.error) {
-    sessionErrorBanner.textContent = `${session.error} — All completed chunks are safely stored on disk. Click "Resume / Retry Pipeline" to continue from where it paused.`;
+    sessionErrorBanner.textContent = `${session.error} — All completed chunks are safely stored in PostgreSQL (transcript_chunks). Click "Resume / Retry Pipeline" to continue.`;
     sessionErrorBanner.classList.remove('hidden');
   } else {
     sessionErrorBanner.classList.add('hidden');
   }
 
-  if (session.status === 'error' || (!isRunning && session.status !== 'completed')) {
-    resumeSessionBtn.classList.remove('hidden');
-  } else {
-    resumeSessionBtn.classList.add('hidden');
-  }
+  resumeSessionBtn.classList.toggle('hidden', !(session.status === 'error' || (!isRunning && session.status !== 'completed')));
 
-  // Live progress calculation
   const chunks = session.chunks || [];
   const completedChunks = chunks.filter((c) => c.status === 'completed').length;
   const noteSections = session.noteSections || [];
@@ -522,14 +498,13 @@ function renderSessionUI(payload) {
     session.fullTranscriptWords || 0
   } Transcript Words • ${session.notesWords || 0} Note Words`;
 
-  // Render chunk pills strip
   chunkPillsStrip.innerHTML = chunks
     .map((c) => {
       const cls = c.status === 'completed' ? 'completed' : c.status === 'transcribing' ? 'transcribing' : '';
       const icon = c.status === 'completed' ? '✓' : c.status === 'transcribing' ? '⟳' : '•';
-      return `<span class="chunk-pill ${cls}" data-chunk-idx="${c.index}" title="Chunk ${c.index + 1}: ${c.wordCount || 0} words">${icon} Chunk ${
-        c.index + 1
-      } (${c.startFormatted}–${c.endFormatted})</span>`;
+      return `<span class="chunk-pill ${cls}" data-chunk-idx="${c.index}" title="${escapeHtml(c.code)}: ${
+        c.wordCount || 0
+      } words">${icon} ${escapeHtml(c.code)} (${c.startFormatted}–${c.endFormatted})</span>`;
     })
     .join('');
 
@@ -541,93 +516,88 @@ function renderSessionUI(payload) {
     });
   });
 
-  // Word counts & export links
   notesWordCountBadge.textContent = `${session.notesWords || 0} words`;
   transcriptWordCountBadge.textContent = `${session.fullTranscriptWords || 0} words`;
 
   exportNotesBtn.href = `/api/sessions/${encodeURIComponent(session.id)}/export/notes.md`;
   exportTranscriptBtn.href = `/api/sessions/${encodeURIComponent(session.id)}/export/transcript.md`;
 
-  renderReaderContent(session, comprehensiveNotesMarkdown, readerSearchInput.value.trim());
+  renderReaderContent(session, comprehensiveNotesMarkdown, readerSearchInput.value.trim(), isRunning);
 }
 
-function renderReaderContent(session, comprehensiveNotesMarkdown, searchQuery = '') {
-  // 1. Render Comprehensive Notes
+function renderReaderContent(session, comprehensiveNotesMarkdown, searchQuery = '', isRunning = false) {
   if (comprehensiveNotesMarkdown && comprehensiveNotesMarkdown.trim()) {
     notesEmptyState.classList.add('hidden');
-    let mdToRender = comprehensiveNotesMarkdown;
-    notesMarkdownContainer.innerHTML = renderMarkdown(mdToRender);
+    notesMarkdownContainer.innerHTML = renderMarkdown(comprehensiveNotesMarkdown);
+
+    notesMarkdownContainer.querySelectorAll('.ts-badge').forEach((badge) => {
+      badge.title = 'Click to inspect the verbatim transcript chunk for this timestamp';
+      badge.addEventListener('click', () => {
+        const rawTs = badge.textContent.replace(/[\[\]]/g, '').trim();
+        const parts = rawTs.split(':').map(Number);
+        const sec = parts.length === 3 ? parts[0] * 3600 + parts[1] * 60 + parts[2] : parts[0] * 60 + parts[1];
+        const targetChunk =
+          (session.chunks || []).find((c) => sec >= c.startTimeSec && sec <= c.endTimeSec) ||
+          (session.chunks || [])[0];
+        if (targetChunk) {
+          switchReaderTab('transcript');
+          const card = document.getElementById(`chunk-card-${targetChunk.index}`);
+          if (card) card.scrollIntoView({ behavior: 'smooth', block: 'start' });
+        }
+      });
+    });
   } else {
     notesEmptyState.classList.remove('hidden');
     notesMarkdownContainer.innerHTML = '';
   }
 
-  // 2. Render Stored Verbatim Transcript Chunks
-  const chunks = session.chunks || [];
-  const completedChunks = chunks.filter((c) => c.status === 'completed' && c.transcriptText);
-
-  if (completedChunks.length === 0) {
-    transcriptChunksContainer.innerHTML = `
-      <div class="empty-state">
-        <h3>Waiting for First Audio Chunk...</h3>
-        <p>Each 5-minute audio chunk is saved permanently to disk and displayed here the moment Gemini finishes transcribing it.</p>
-      </div>
-    `;
-    return;
-  }
-
-  const q = searchQuery.toLowerCase();
-  const filtered = q
-    ? completedChunks.filter((c) => c.transcriptText.toLowerCase().includes(q))
-    : completedChunks;
-
-  transcriptChunksContainer.innerHTML = filtered
-    .map((c) => {
-      return `
-        <div class="transcript-card" id="chunk-card-${c.index}">
-          <div class="transcript-card-header">
-            <span class="transcript-card-title">Segment ${c.index + 1} — [${c.startFormatted} to ${c.endFormatted}]</span>
-            <span class="transcript-card-meta">${c.wordCount || 0} words • Stored on disk (${escapeHtml(
-        c.modelUsed || 'Gemini Flash'
-      )})</span>
-          </div>
-          <div class="transcript-card-body">${escapeHtml(c.transcriptText)}</div>
-        </div>
-      `;
-    })
-    .join('');
+  renderTranscriptChunks({
+    containerEl: transcriptChunksContainer,
+    session,
+    searchQuery,
+    isRunning,
+    onChunkModified: ({ chunkIndex, model, updateNotesFromHere, isManualEdit, message }) => {
+      if (message) liveStatusText.textContent = message;
+      if (!updateNotesFromHere) {
+        lastModifiedChunkIndex =
+          lastModifiedChunkIndex === null ? chunkIndex : Math.min(lastModifiedChunkIndex, chunkIndex);
+        notesSyncBannerText.textContent = isManualEdit
+          ? `✓ Chunk ${chunkIndex + 1} transcript was manually edited in PostgreSQL. Update the structured lecture notes?`
+          : `⟳ Reprocessing Chunk ${chunkIndex + 1} (${session.code}-C${String(chunkIndex + 1).padStart(
+              2,
+              '0'
+            )}) with ${model}... Once done, click here to update the structured lecture notes:`;
+        notesSyncBanner.classList.remove('hidden');
+      } else {
+        lastModifiedChunkIndex = null;
+        notesSyncBanner.classList.add('hidden');
+      }
+    },
+    onRefreshSession: fetchAndRenderSessionDetails
+  });
 }
 
-// Reader Tab Switching
 readerTabs.forEach((btn) => {
-  btn.addEventListener('click', () => {
-    switchReaderTab(btn.dataset.tab);
-  });
+  btn.addEventListener('click', () => switchReaderTab(btn.dataset.tab));
 });
 
 function switchReaderTab(tabName) {
   currentReaderTab = tabName;
   readerTabs.forEach((b) => b.classList.toggle('active', b.dataset.tab === tabName));
-  if (tabName === 'notes') {
-    notesTabPane.classList.remove('hidden');
-    transcriptTabPane.classList.add('hidden');
-  } else {
-    notesTabPane.classList.add('hidden');
-    transcriptTabPane.classList.remove('hidden');
-  }
+  notesTabPane.classList.toggle('hidden', tabName !== 'notes');
+  transcriptTabPane.classList.toggle('hidden', tabName === 'notes');
 }
 
-// Search Filter
 readerSearchInput.addEventListener('input', () => {
   if (!currentSessionData) return;
   renderReaderContent(
     currentSessionData.session,
     currentSessionData.comprehensiveNotesMarkdown,
-    readerSearchInput.value.trim()
+    readerSearchInput.value.trim(),
+    currentSessionData.isRunning
   );
 });
 
-// Copy Current Tab Content
 copyCurrentTabBtn.addEventListener('click', async () => {
   if (!currentSessionData) return;
   const textToCopy =
@@ -644,7 +614,6 @@ copyCurrentTabBtn.addEventListener('click', async () => {
   }, 1800);
 });
 
-// Resume / Regenerate / Delete Actions
 resumeSessionBtn.addEventListener('click', async () => {
   if (!currentSessionId) return;
   await fetch(`/api/sessions/${encodeURIComponent(currentSessionId)}/resume`, { method: 'POST' });
@@ -653,20 +622,54 @@ resumeSessionBtn.addEventListener('click', async () => {
 
 regenerateNotesBtn.addEventListener('click', async () => {
   if (!currentSessionId) return;
-  await fetch(`/api/sessions/${encodeURIComponent(currentSessionId)}/regenerate-notes`, { method: 'POST' });
+  notesSyncBanner.classList.add('hidden');
+  lastModifiedChunkIndex = null;
+  await fetch(`/api/sessions/${encodeURIComponent(currentSessionId)}/regenerate-notes`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({})
+  });
+  await fetchAndRenderSessionDetails(currentSessionId);
+});
+
+smartUpdateNotesBtn.addEventListener('click', async () => {
+  if (!currentSessionId) return;
+  const startFrom = lastModifiedChunkIndex ?? 0;
+  notesSyncBanner.classList.add('hidden');
+  lastModifiedChunkIndex = null;
+  switchReaderTab('notes');
+  await fetch(`/api/sessions/${encodeURIComponent(currentSessionId)}/regenerate-notes`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ startFromChunkIndex: startFrom })
+  });
+  await fetchAndRenderSessionDetails(currentSessionId);
+});
+
+fullRebuildNotesBannerBtn.addEventListener('click', async () => {
+  if (!currentSessionId) return;
+  notesSyncBanner.classList.add('hidden');
+  lastModifiedChunkIndex = null;
+  switchReaderTab('notes');
+  await fetch(`/api/sessions/${encodeURIComponent(currentSessionId)}/regenerate-notes`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({})
+  });
   await fetchAndRenderSessionDetails(currentSessionId);
 });
 
 deleteSessionBtn.addEventListener('click', async () => {
   if (!currentSessionId) return;
-  if (!confirm('Delete this stored recording session and its transcripts?')) return;
+  if (!confirm('Delete this lecture and all its chunks/notes from PostgreSQL?')) return;
   await fetch(`/api/sessions/${encodeURIComponent(currentSessionId)}`, { method: 'DELETE' });
   currentSessionId = null;
   currentSessionData = null;
   sessionView.classList.add('hidden');
   importView.classList.remove('hidden');
+  await loadSubjects();
   await refreshSessionsList();
 });
 
 // Initial Boot
-refreshSessionsList();
+loadSubjects().then(() => refreshSessionsList());

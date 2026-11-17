@@ -1,264 +1,185 @@
-import { callGeminiWithRetry } from './transcriber.js';
 import { SessionStorage } from './storage.js';
+import { callGeminiWithRetry } from '../ai/gemini.client.js';
+import { buildCumulativeNotesPrompts, buildMasterReferencePrompts } from '../ai/prompts/notes.prompt.js';
 
-/**
- * Groups completed transcript chunks into small windows (default 2 chunks = ~10 mins)
- * so Gemini generates exhaustive, encyclopedic notes for every single part of the lecture
- * without ever compressing or summarizing away details.
- */
-function buildNoteSectionsFromChunks(chunks, chunksPerSection = 2) {
+function buildNoteSectionsFromChunks(chunks) {
   const completed = (chunks || [])
     .filter((c) => c.status === 'completed' && c.transcriptText)
     .sort((a, b) => a.index - b.index);
 
-  const sections = [];
-  for (let i = 0; i < completed.length; i += chunksPerSection) {
-    const slice = completed.slice(i, i + chunksPerSection);
-    const sectionIndex = sections.length;
-    sections.push({
-      sectionIndex,
-      chunkIndices: slice.map((c) => c.index),
-      startFormatted: slice[0].startFormatted,
-      endFormatted: slice[slice.length - 1].endFormatted,
-      status: 'pending',
-      contentMarkdown: '',
-      wordCount: 0,
-      modelUsed: '',
-      updatedAt: null
-    });
-  }
-  return sections;
+  return completed.map((c, idx) => ({
+    sectionIndex: idx,
+    chunkIndices: [c.index],
+    startFormatted: c.startFormatted,
+    endFormatted: c.endFormatted
+  }));
 }
 
-/**
- * Generates exhaustive, textbook-depth notes for a single section (1-2 chunks of verbatim transcript).
- */
-async function generateExhaustiveSectionNotes({
-  sessionTitle,
-  sessionTopic,
-  section,
-  totalSections,
-  chunkTranscripts,
-  onStatus
-}) {
-  const systemInstruction = [
-    `You are an elite academic and technical scribe creating EXHAUSTIVE, COMPREHENSIVE lecture and discussion notes.`,
-    `CRITICAL DIRECTIVE — NEVER SUMMARIZE:`,
-    `- Your output must NEVER be a brief overview or surface-level summary.`,
-    `- You must document EVERY SINGLE concept, explanation, step-by-step reasoning, derivation, example, real-world analogy, debate, question-and-answer, number/statistic, and nuance discussed in the transcript segment.`,
-    `- Someone reading your notes should learn 100% of what was taught or discussed in the recording without ever needing to listen to the audio.`,
-    `FORMATTING & DEPTH RULES:`,
-    `1. Use clear Markdown subheadings (####) for each topic or discussion shift within this timeline (${section.startFormatted} – ${section.endFormatted}), including timestamp references like [${section.startFormatted}].`,
-    `2. Explain every concept thoroughly in full sentences and structured bullet hierarchies: state the idea, WHY it works that way, HOW it was explained, and any caveats or edge cases mentioned.`,
-    `3. Capture ALL examples, analogies, case studies, and hypothetical scenarios used by the speaker in complete detail.`,
-    `4. Write out any formulas, equations, algorithms, code patterns, or technical terminology explicitly and explain each variable/component.`,
-    `5. If questions, doubts, or back-and-forth conversation occurred, include a dedicated "**Discussion & Q&A Details**" block capturing the exact question and the full explanation given.`,
-    `6. If the speaker mentioned any exam tips, common mistakes, homework, readings, or action items, highlight them in a \`> [!IMPORTANT]\` callout block.`
-  ].join('\n');
+export async function generateComprehensiveNotesForSession(
+  sessionId,
+  forceOrOptions = false,
+  onEvent = null
+) {
+  const forceRegenerate =
+    typeof forceOrOptions === 'boolean' ? forceOrOptions : Boolean(forceOrOptions?.forceRegenerate);
+  const startFromChunkIndex =
+    typeof forceOrOptions === 'object' &&
+    forceOrOptions !== null &&
+    forceOrOptions.startFromChunkIndex !== undefined &&
+    forceOrOptions.startFromChunkIndex !== null
+      ? Number(forceOrOptions.startFromChunkIndex)
+      : null;
 
-  const combinedSegmentText = chunkTranscripts
-    .map(
-      (c) =>
-        `--- TRANSCRIPT CHUNK ${c.index + 1} (${c.startFormatted} to ${c.endFormatted}) ---\n${c.transcriptText}`
-    )
-    .join('\n\n');
+  let session = await SessionStorage.getSession(sessionId);
+  if (!session) throw new Error(`Lecture not found: ${sessionId}`);
 
-  const userPrompt = [
-    `Lecture / Recording Title: "${sessionTitle}"`,
-    sessionTopic ? `Course / Subject Context: "${sessionTopic}"` : '',
-    `Section: Part ${section.sectionIndex + 1} of ${totalSections} (Timeline: ${section.startFormatted} – ${section.endFormatted})`,
-    ``,
-    `Below is the verbatim transcript for ${section.startFormatted} – ${section.endFormatted}.`,
-    `Produce exhaustive, comprehensive, textbook-grade notes covering EVERY detail, explanation, example, formula, and discussion point in this segment. Do not leave anything out:`,
-    ``,
-    combinedSegmentText
-  ]
-    .filter((l) => l !== null)
-    .join('\n');
+  const completedChunks = (session.chunks || [])
+    .filter((c) => c.status === 'completed' && c.transcriptText)
+    .sort((a, b) => a.index - b.index);
 
-  const { text, model } = await callGeminiWithRetry(
-    {
-      contents: [{ role: 'user', parts: [{ text: userPrompt }] }],
-      systemInstruction,
-      generationConfig: {
-        temperature: 0.15,
-        maxOutputTokens: 8192
-      }
-    },
-    onStatus
-  );
-
-  return { contentMarkdown: text, modelUsed: model };
-}
-
-/**
- * Generates the Master Reference Index (Complete Topic Roadmap, Glossary of All Terms/Formulas,
- * and Consolidated Action Items / Key Takeaways) from the compiled exhaustive sections.
- */
-async function generateMasterReferenceIndex({ sessionTitle, sessionTopic, durationFormatted, noteSections, onStatus }) {
-  const systemInstruction = [
-    `You are compiling the Master Reference Guide & Index to sit at the top of an exhaustive multi-part lecture notes document.`,
-    `Based on the detailed chronological notes provided, generate a rich Markdown reference header containing:`,
-    `1. **## Complete Topic Roadmap & Timeline**: A chronological table or structured breakdown of every topic and sub-topic covered across the recording with their timestamps.`,
-    `2. **## Complete Glossary of Terms, Concepts & Definitions**: Every technical term, concept, framework, or key entity discussed in the lecture with its complete definition as explained in the session.`,
-    `3. **## Formulas, Rules, Frameworks & Core Principles**: Every equation, technical rule, step-by-step procedure, or core principle covered.`,
-    `4. **## Action Items, Assignments, Exam Hints & Open Questions**: Every deadline, homework detail, recommended reading, common pitfall, or follow-up item mentioned (if none were mentioned, summarize the practical takeaways).`,
-    `Do NOT replace the chronological notes—this is the structured reference index that precedes the full chronological breakdown.`
-  ].join('\n');
-
-  const sectionsDigest = noteSections
-    .map(
-      (s) =>
-        `### Part ${s.sectionIndex + 1} (${s.startFormatted} – ${s.endFormatted})\n${s.contentMarkdown}`
-    )
-    .join('\n\n');
-
-  const userPrompt = [
-    `Lecture / Recording Title: "${sessionTitle}"`,
-    sessionTopic ? `Subject / Topic: "${sessionTopic}"` : '',
-    durationFormatted ? `Total Duration: ${durationFormatted}` : '',
-    ``,
-    `Here are the exhaustive chronological notes for the entire session. Generate the complete Master Reference Guide & Index (Topic Roadmap, Complete Glossary, Formulas/Frameworks, and Action Items):`,
-    ``,
-    sectionsDigest
-  ]
-    .filter(Boolean)
-    .join('\n');
-
-  const { text } = await callGeminiWithRetry(
-    {
-      contents: [{ role: 'user', parts: [{ text: userPrompt }] }],
-      systemInstruction,
-      generationConfig: {
-        temperature: 0.15,
-        maxOutputTokens: 8192
-      }
-    },
-    onStatus
-  );
-
-  return text;
-}
-
-/**
- * Generates and persists the complete, multi-section exhaustive lecture notes for a session.
- */
-export async function generateComprehensiveNotesForSession(sessionId, forceRegenerate = false, onEvent = null) {
-  let session = SessionStorage.getSession(sessionId);
-  if (!session) throw new Error(`Session not found: ${sessionId}`);
-
-  const completedChunks = (session.chunks || []).filter((c) => c.status === 'completed' && c.transcriptText);
   if (completedChunks.length === 0) {
-    throw new Error('No transcribed chunks available yet to generate notes.');
+    throw new Error('No transcribed chunks available yet in PostgreSQL to generate notes.');
   }
 
-  session.status = 'generating_notes';
-  session.error = null;
+  await SessionStorage.updateLectureFields(session.id, {
+    status: 'generating_notes',
+    error: null
+  });
 
-  if (forceRegenerate || !session.noteSections || session.noteSections.length === 0) {
-    session.noteSections = buildNoteSectionsFromChunks(session.chunks, 2);
-    session.masterIndexMarkdown = '';
+  if (
+    forceRegenerate ||
+    !session.noteSections ||
+    session.noteSections.length !== completedChunks.length
+  ) {
+    const sectionsBlueprint = buildNoteSectionsFromChunks(completedChunks);
+    session = await SessionStorage.initNoteSections(session.id, sectionsBlueprint, true);
   }
-
-  SessionStorage.saveSession(session);
 
   const totalSections = session.noteSections.length;
+  let accumulatedNotesSoFar = '';
 
   for (let i = 0; i < totalSections; i++) {
-    session = SessionStorage.getSession(sessionId);
+    session = await SessionStorage.getSession(session.id);
     const sec = session.noteSections[i];
+    const currentChunk = completedChunks[i];
+    const prevChunk = i > 0 ? completedChunks[i - 1] : null;
+    const previousTranscriptTail = prevChunk ? prevChunk.transcriptText.trim().slice(-650) : '';
 
-    if (!forceRegenerate && sec.status === 'completed' && sec.contentMarkdown) {
+    const shouldSkipExisting =
+      !forceRegenerate &&
+      (startFromChunkIndex === null
+        ? sec.status === 'completed' && sec.contentMarkdown
+        : i < startFromChunkIndex && sec.status === 'completed' && sec.contentMarkdown);
+
+    if (shouldSkipExisting) {
+      accumulatedNotesSoFar += (accumulatedNotesSoFar ? '\n\n' : '') + sec.contentMarkdown.trim();
       if (onEvent) {
         onEvent({
           type: 'note_section_completed',
           sectionIndex: sec.sectionIndex,
+          sectionCode: sec.code,
           totalSections,
           section: sec,
-          message: `Note section ${i + 1}/${totalSections} (${sec.startFormatted} – ${sec.endFormatted}) already stored.`
+          message: `Note section ${sec.code} (${sec.startFormatted} – ${sec.endFormatted}) already stored in PostgreSQL.`
         });
       }
       continue;
     }
 
-    sec.status = 'generating';
-    session.statusMessage = `Writing exhaustive notes for Part ${i + 1} of ${totalSections} (${sec.startFormatted} – ${sec.endFormatted})...`;
-    SessionStorage.saveSession(session);
+    const statusMsg = `Structuring cumulative lecture notes for ${sec.code} — Segment ${i + 1} of ${totalSections} (${sec.startFormatted} – ${sec.endFormatted}) with full prior context...`;
+    await SessionStorage.markNoteSectionStatus(session.id, sec.sectionIndex, 'generating', statusMsg);
 
     if (onEvent) {
       onEvent({
         type: 'note_section_started',
         sectionIndex: sec.sectionIndex,
+        sectionCode: sec.code,
         totalSections,
         startFormatted: sec.startFormatted,
         endFormatted: sec.endFormatted,
-        message: session.statusMessage
+        message: statusMsg
       });
     }
 
-    const sectionChunks = session.chunks.filter((c) => sec.chunkIndices.includes(c.index));
-
-    const { contentMarkdown, modelUsed } = await generateExhaustiveSectionNotes({
+    const { systemInstruction, userPrompt } = buildCumulativeNotesPrompts({
+      lectureCode: session.code,
+      subjectName: session.subjectName,
       sessionTitle: session.title,
       sessionTopic: session.topic,
       section: sec,
       totalSections,
-      chunkTranscripts: sectionChunks,
-      onStatus: (waitMsg) => {
-        if (onEvent) onEvent({ type: 'rate_limit_wait', message: waitMsg });
-      }
+      accumulatedNotesSoFar,
+      previousTranscriptTail,
+      currentChunkTranscript: currentChunk.transcriptText
     });
 
-    session = SessionStorage.saveNoteSection(sessionId, sec.sectionIndex, contentMarkdown, modelUsed);
+    const { text: contentMarkdown, model: modelUsed } = await callGeminiWithRetry(
+      {
+        contents: [{ role: 'user', parts: [{ text: userPrompt }] }],
+        systemInstruction,
+        generationConfig: { temperature: 0.15, maxOutputTokens: 65536 }
+      },
+      (waitMsg) => {
+        if (onEvent) onEvent({ type: 'rate_limit_wait', message: waitMsg });
+      }
+    );
+
+    session = await SessionStorage.saveNoteSection(session.id, sec.sectionIndex, contentMarkdown, modelUsed);
+    accumulatedNotesSoFar += (accumulatedNotesSoFar ? '\n\n' : '') + contentMarkdown.trim();
 
     if (onEvent) {
       onEvent({
         type: 'note_section_completed',
         sectionIndex: sec.sectionIndex,
+        sectionCode: sec.code,
         totalSections,
         section: session.noteSections[i],
         notesWords: session.notesWords,
-        message: `Completed exhaustive notes for Part ${i + 1}/${totalSections} (${session.noteSections[i].wordCount} words)`
+        message: `Stored structured notes ${sec.code} in PostgreSQL (${session.noteSections[i].wordCount} words)`
       });
     }
   }
 
-  // Generate the Master Reference Index & Glossary across all sections
-  session = SessionStorage.getSession(sessionId);
-  if (forceRegenerate || !session.masterIndexMarkdown) {
-    session.statusMessage = 'Compiling Master Reference Index, Glossary & Formula Sheet...';
-    SessionStorage.saveSession(session);
+  session = await SessionStorage.getSession(session.id);
+  if (forceRegenerate || startFromChunkIndex !== null || !session.masterIndexMarkdown) {
+    const masterStatusMsg = `Compiling ${session.code}-MASTER Executive Overview, Outline & Formula Reference...`;
+    await SessionStorage.updateLectureFields(session.id, { statusMessage: masterStatusMsg });
 
     if (onEvent) {
-      onEvent({
-        type: 'master_index_started',
-        message: session.statusMessage
-      });
+      onEvent({ type: 'master_index_started', message: masterStatusMsg });
     }
 
-    const masterIndex = await generateMasterReferenceIndex({
+    const { systemInstruction, userPrompt } = buildMasterReferencePrompts({
+      lectureCode: session.code,
+      subjectName: session.subjectName,
       sessionTitle: session.title,
       sessionTopic: session.topic,
       durationFormatted: session.audioMetadata?.durationFormatted || '',
-      noteSections: session.noteSections,
-      onStatus: (waitMsg) => {
+      fullChronologicalNotes: accumulatedNotesSoFar
+    });
+
+    const { text: masterIndex, model } = await callGeminiWithRetry(
+      {
+        contents: [{ role: 'user', parts: [{ text: userPrompt }] }],
+        systemInstruction,
+        generationConfig: { temperature: 0.15, maxOutputTokens: 65536 }
+      },
+      (waitMsg) => {
         if (onEvent) onEvent({ type: 'rate_limit_wait', message: waitMsg });
       }
-    });
+    );
 
-    session = SessionStorage.saveMasterIndex(sessionId, masterIndex);
+    session = await SessionStorage.saveMasterIndex(session.id, masterIndex, model);
   }
 
-  session.status = 'completed';
-  session.statusMessage = `Completed! Stored ${session.fullTranscriptWords} words of verbatim transcript and ${session.notesWords} words of comprehensive notes.`;
-  SessionStorage.saveSession(session);
+  const doneMsg = `Completed [${session.code}]! Stored ${session.fullTranscriptWords} transcript words and ${session.notesWords} structured note words in PostgreSQL.`;
+  session = await SessionStorage.updateLectureFields(session.id, {
+    status: 'completed',
+    statusMessage: doneMsg
+  });
 
   if (onEvent) {
-    onEvent({
-      type: 'session_completed',
-      session,
-      message: session.statusMessage
-    });
+    onEvent({ type: 'session_completed', session, message: doneMsg });
   }
 
   return session;

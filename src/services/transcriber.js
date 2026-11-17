@@ -2,244 +2,294 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { CONFIG } from '../config.js';
 import { SessionStorage } from './storage.js';
+import { enhanceChunkAudioForRetry } from './audio.js';
+import { getRollingTail } from '../utils/format.js';
+import { callGeminiWithRetry, enforceApiPacing } from '../ai/gemini.client.js';
+import { detectTranscriptHallucination, sanitizeTranscriptText } from '../ai/guards/hallucination.js';
+import { buildChunkTranscriptionPrompts } from '../ai/prompts/transcript.prompt.js';
 
-let lastGeminiCallTimestamp = 0;
+export { callGeminiWithRetry, enforceApiPacing, detectTranscriptHallucination, sanitizeTranscriptText };
 
-function sleep(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-/**
- * Enforces Free Tier request spacing so we stay comfortably under 15 RPM.
- */
-export async function enforceFreeTierPacing() {
-  const now = Date.now();
-  const elapsed = now - lastGeminiCallTimestamp;
-  if (lastGeminiCallTimestamp > 0 && elapsed < CONFIG.freeTierMinIntervalMs) {
-    await sleep(CONFIG.freeTierMinIntervalMs - elapsed);
-  }
-  lastGeminiCallTimestamp = Date.now();
-}
-
-/**
- * Calls the Gemini generateContent REST API with automatic model fallback and rate-limit retry.
- */
-export async function callGeminiWithRetry({ contents, systemInstruction, generationConfig = {} }, onStatus = null) {
-  const apiKey = CONFIG.geminiApiKey;
-  if (!apiKey) {
-    throw new Error('GEMINI_API_KEY is missing in .env');
-  }
-
-  const models = CONFIG.geminiModels;
-  let lastError = null;
-
-  for (const model of models) {
-    const maxAttempts = 4;
-    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-      await enforceFreeTierPacing();
-
-      const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${encodeURIComponent(apiKey)}`;
-      const body = {
-        contents,
-        generationConfig: {
-          temperature: 0.1,
-          maxOutputTokens: 8192,
-          ...generationConfig
-        }
-      };
-
-      if (systemInstruction) {
-        body.systemInstruction = {
-          parts: [{ text: systemInstruction }]
-        };
-      }
-
-      try {
-        const res = await fetch(endpoint, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(body)
-        });
-
-        if (res.ok) {
-          const data = await res.json();
-          const text = (data?.candidates?.[0]?.content?.parts || [])
-            .map((p) => p.text || '')
-            .join('')
-            .trim();
-
-          if (!text) {
-            const finishReason = data?.candidates?.[0]?.finishReason || 'UNKNOWN';
-            throw new Error(`Gemini (${model}) returned empty output (finishReason: ${finishReason})`);
-          }
-
-          return { text, model };
-        }
-
-        const errText = await res.text();
-        let errMessage = `HTTP ${res.status}: ${errText.slice(0, 300)}`;
-        try {
-          const parsed = JSON.parse(errText);
-          if (parsed?.error?.message) errMessage = parsed.error.message;
-        } catch {
-          // ignore
-        }
-
-        // If 404 (model not found/supported on this key), break inner loop and try next model
-        if (res.status === 404) {
-          lastError = new Error(`Model ${model} not available: ${errMessage}`);
-          break;
-        }
-
-        // If 429 (Free Tier rate limit) or 503 (overloaded), wait and retry
-        if (res.status === 429 || res.status === 503) {
-          const waitSec = attempt * 12;
-          if (onStatus) {
-            onStatus(`Free Tier rate limit reached on ${model}; pausing ${waitSec}s before retry (${attempt}/${maxAttempts})...`);
-          }
-          await sleep(waitSec * 1000);
-          lastError = new Error(errMessage);
-          continue;
-        }
-
-        throw new Error(errMessage);
-      } catch (err) {
-        lastError = err;
-        if (attempt < maxAttempts) {
-          await sleep(attempt * 4000);
-        }
-      }
-    }
-  }
-
-  throw lastError || new Error('All Gemini models failed to respond.');
-}
-
-/**
- * Extracts the last ~450 characters of a transcript string to serve as rolling context
- * for the next audio chunk.
- */
-function getRollingTail(text, maxChars = 450) {
-  if (!text) return '';
-  const cleaned = text.trim();
-  if (cleaned.length <= maxChars) return cleaned;
-  const sliced = cleaned.slice(-maxChars);
-  const firstSpace = sliced.indexOf(' ');
-  return firstSpace > 0 ? sliced.slice(firstSpace + 1) : sliced;
-}
-
-/**
- * Transcribes a single audio chunk verbatim with rolling context from the previous chunk.
- */
-export async function transcribeSingleChunk({
-  chunkFilePath,
+async function runChunkTranscriptionPass({
+  audioPathToUse,
   chunk,
   totalChunks,
+  lectureCode,
+  subjectName,
   title,
   topic,
   previousTail,
+  preferredModel,
+  useStrictGuardrails = false,
+  customHint = '',
   onStatus
 }) {
-  const audioBuffer = fs.readFileSync(chunkFilePath);
+  const audioBuffer = fs.readFileSync(audioPathToUse);
   const base64Audio = audioBuffer.toString('base64');
 
-  const systemInstruction = [
-    `You are an expert verbatim academic lecture and conversation transcriptionist.`,
-    `Your job is to produce a COMPLETE, ACCURATE, WORD-FOR-WORD verbatim transcript of the provided audio segment.`,
-    `CRITICAL RULES:`,
-    `1. NEVER summarize, paraphrase, condense, or skip any portion of the speech. Every explanation, example, tangent, question, and detail spoken must be transcribed in full.`,
-    `2. Clean up only meaningless non-lexical stutters ("uh", "umm") while keeping every actual spoken sentence intact and readable.`,
-    `3. Insert periodic timestamp markers in brackets like [${chunk.startFormatted}] at the start and roughly every 45-60 seconds or on speaker/topic shifts, using the real lecture timeline starting from ${chunk.startFormatted} and ending at ${chunk.endFormatted}.`,
-    `4. If multiple speakers are audible (e.g. Professor / Student, or Speaker 1 / Speaker 2), label speaker turns clearly.`,
-    `5. Output ONLY the verbatim transcript text—do not include introductory or concluding meta-commentary.`
-  ].join('\n');
-
-  const promptParts = [
-    `Recording Title: "${title || 'Lecture Recording'}"`,
-    topic ? `Subject / Topic Context (use for accurate spelling of technical terms & jargon): "${topic}"` : '',
-    `Current Audio Segment: Chunk ${chunk.index + 1} of ${totalChunks} (Timeline: ${chunk.startFormatted} to ${chunk.endFormatted}).`
-  ].filter(Boolean);
-
-  if (previousTail) {
-    promptParts.push(
-      `\n<previous_chunk_tail>\n${previousTail}\n</previous_chunk_tail>\n` +
-        `Instruction for continuity: The text in <previous_chunk_tail> is the end of the immediately preceding audio chunk. ` +
-        `If the first few seconds of this audio segment repeat the final words of <previous_chunk_tail>, do NOT duplicate those repeated words—continue seamlessly right after them.`
-    );
-  }
-
-  promptParts.push(
-    `\nNow transcribe this audio segment (${chunk.startFormatted} – ${chunk.endFormatted}) completely and verbatim:`
-  );
-
-  const contents = [
-    {
-      role: 'user',
-      parts: [
-        {
-          inlineData: {
-            mimeType: 'audio/mp3',
-            data: base64Audio
-          }
-        },
-        {
-          text: promptParts.join('\n')
-        }
-      ]
-    }
-  ];
+  const { systemInstruction, userPrompt } = buildChunkTranscriptionPrompts({
+    chunk,
+    totalChunks,
+    lectureCode,
+    subjectName,
+    title,
+    topic,
+    previousTail,
+    useStrictGuardrails,
+    customHint
+  });
 
   const { text, model } = await callGeminiWithRetry(
     {
-      contents,
+      contents: [
+        {
+          role: 'user',
+          parts: [
+            { inlineData: { mimeType: 'audio/mp3', data: base64Audio } },
+            { text: userPrompt }
+          ]
+        }
+      ],
       systemInstruction,
       generationConfig: {
-        temperature: 0.1,
-        maxOutputTokens: 8192
-      }
+        temperature: useStrictGuardrails ? 0.25 : 0.1,
+        maxOutputTokens: 65536
+      },
+      preferredModel
     },
     onStatus
   );
 
-  return { transcriptText: text, modelUsed: model };
+  return {
+    transcriptText: sanitizeTranscriptText(text),
+    rawText: text,
+    modelUsed: model
+  };
 }
 
-/**
- * Transcribes all pending chunks in a session sequentially, persisting each chunk's transcript
- * to disk immediately upon completion so zero progress is ever lost.
- */
-export async function transcribeSessionChunks(sessionId, onEvent = null) {
-  let session = SessionStorage.getSession(sessionId);
-  if (!session) throw new Error(`Session not found: ${sessionId}`);
+export async function transcribeSingleChunk({
+  chunkFilePath,
+  chunk,
+  totalChunks,
+  lectureCode,
+  subjectName,
+  title,
+  topic,
+  previousTail,
+  preferredModel = CONFIG.defaultChunkModel,
+  forceGuardrails = false,
+  enhanceAudio = false,
+  customHint = '',
+  onStatus
+}) {
+  let audioPathToUse = chunkFilePath;
+  let tempEnhancedPath = null;
 
-  const sessionDir = SessionStorage.getSessionDir(sessionId);
+  try {
+    if (enhanceAudio) {
+      tempEnhancedPath = `${chunkFilePath}.enhanced.mp3`;
+      await enhanceChunkAudioForRetry(chunkFilePath, tempEnhancedPath);
+      audioPathToUse = tempEnhancedPath;
+    }
+
+    const firstPass = await runChunkTranscriptionPass({
+      audioPathToUse,
+      chunk,
+      totalChunks,
+      lectureCode,
+      subjectName,
+      title,
+      topic,
+      previousTail,
+      preferredModel,
+      useStrictGuardrails: forceGuardrails,
+      customHint,
+      onStatus
+    });
+
+    const check = detectTranscriptHallucination(firstPass.rawText);
+    if (!check.isHallucinated && firstPass.transcriptText.length > 20) {
+      return {
+        transcriptText: firstPass.transcriptText,
+        modelUsed: firstPass.modelUsed,
+        autoRetried: false
+      };
+    }
+
+    // Hallucination detected on THIS chunk only -> escalate ONLY this chunk to heavy model + speech boost
+    const heavyModel = CONFIG.retryHeavyModel || 'gemini-2.5-pro';
+    if (onStatus) {
+      onStatus(
+        `⚠️ Detected hallucination (${check.reason}) on ${chunk.code} with ${firstPass.modelUsed}. Auto-reprocessing THIS chunk only with ${heavyModel} + Speech-Boost Guardrails...`
+      );
+    }
+
+    if (!tempEnhancedPath) {
+      tempEnhancedPath = `${chunkFilePath}.enhanced.mp3`;
+      await enhanceChunkAudioForRetry(chunkFilePath, tempEnhancedPath);
+    }
+
+    const retryPass = await runChunkTranscriptionPass({
+      audioPathToUse: tempEnhancedPath,
+      chunk,
+      totalChunks,
+      lectureCode,
+      subjectName,
+      title,
+      topic,
+      previousTail,
+      preferredModel: heavyModel,
+      useStrictGuardrails: true,
+      customHint,
+      onStatus
+    });
+
+    return {
+      transcriptText: retryPass.transcriptText || firstPass.transcriptText,
+      modelUsed: `${retryPass.modelUsed} (Auto-Guardrail Retry)`,
+      autoRetried: true,
+      hallucinationReason: check.reason
+    };
+  } finally {
+    if (tempEnhancedPath && fs.existsSync(tempEnhancedPath)) {
+      try {
+        fs.unlinkSync(tempEnhancedPath);
+      } catch {
+        // ignore
+      }
+    }
+  }
+}
+
+export async function retranscribeSingleChunkInSession(
+  sessionId,
+  chunkIndex,
+  { model = CONFIG.retryHeavyModel, enhanceAudio = true, customHint = '' } = {},
+  onEvent = null
+) {
+  let session = await SessionStorage.getSession(sessionId);
+  if (!session) throw new Error(`Lecture not found in PostgreSQL: ${sessionId}`);
+
+  const idx = Number(chunkIndex);
+  const chunk = session.chunks.find((c) => c.index === idx);
+  if (!chunk) throw new Error(`Chunk index ${idx} not found in lecture ${session.code}`);
+
+  const sessionDir = SessionStorage.getSessionDir(session.id);
+  const chunkFilePath = path.join(sessionDir, 'chunks', chunk.fileName);
+  if (!fs.existsSync(chunkFilePath)) {
+    throw new Error(`Audio file for ${chunk.code} not found on disk: ${chunkFilePath}`);
+  }
+
+  let previousTail = '';
+  if (idx > 0) {
+    const prevChunk = session.chunks.find((c) => c.index === idx - 1);
+    if (prevChunk && prevChunk.transcriptText) {
+      const checkPrev = detectTranscriptHallucination(prevChunk.transcriptText);
+      if (!checkPrev.isHallucinated) {
+        previousTail = getRollingTail(prevChunk.transcriptText);
+      }
+    }
+  }
+
+  const startMsg = `Reprocessing ${chunk.code} (${chunk.startFormatted} – ${chunk.endFormatted}) with ${model}${
+    enhanceAudio ? ' + Speech-Boost & Anti-Loop Guardrails' : ' + Anti-Loop Guardrails'
+  }...`;
+  await SessionStorage.markChunkStatus(session.id, idx, 'transcribing', startMsg);
+
+  if (onEvent) {
+    onEvent({
+      type: 'chunk_started',
+      chunkIndex: idx,
+      chunkCode: chunk.code,
+      totalChunks: session.chunks.length,
+      message: startMsg
+    });
+  }
+
+  try {
+    const { transcriptText, modelUsed } = await transcribeSingleChunk({
+      chunkFilePath,
+      chunk,
+      totalChunks: session.chunks.length,
+      lectureCode: session.code,
+      subjectName: session.subjectName,
+      title: session.title,
+      topic: session.topic,
+      previousTail,
+      preferredModel: model,
+      forceGuardrails: true,
+      enhanceAudio: Boolean(enhanceAudio),
+      customHint,
+      onStatus: (msg) => {
+        if (onEvent) onEvent({ type: 'rate_limit_wait', chunkIndex: idx, message: msg });
+      }
+    });
+
+    const label = `${modelUsed}${enhanceAudio ? ' + SpeechBoost' : ''}`;
+    session = await SessionStorage.saveChunkTranscript(session.id, idx, transcriptText, label);
+    const updatedChunk = session.chunks.find((c) => c.index === idx);
+
+    const doneMsg = `Re-extracted ${chunk.code} with ${modelUsed} (${updatedChunk.wordCount} words stored in PostgreSQL). You can now update the lecture notes!`;
+    await SessionStorage.updateLectureFields(session.id, { statusMessage: doneMsg });
+
+    if (onEvent) {
+      onEvent({
+        type: 'chunk_reprocessed',
+        chunkIndex: idx,
+        chunkCode: chunk.code,
+        chunk: updatedChunk,
+        fullTranscriptWords: session.fullTranscriptWords,
+        message: doneMsg
+      });
+    }
+
+    return await SessionStorage.getSession(session.id);
+  } catch (err) {
+    await SessionStorage.markChunkStatus(
+      session.id,
+      idx,
+      chunk.transcriptText ? 'completed' : 'error',
+      `Reprocess error on ${chunk.code}: ${err.message}`
+    );
+    throw err;
+  }
+}
+
+export async function transcribeSessionChunks(sessionId, onEvent = null) {
+  let session = await SessionStorage.getSession(sessionId);
+  if (!session) throw new Error(`Lecture not found: ${sessionId}`);
+
+  const sessionDir = SessionStorage.getSessionDir(session.id);
   const chunksDir = path.join(sessionDir, 'chunks');
 
-  session.status = 'transcribing';
-  session.error = null;
-  SessionStorage.saveSession(session);
+  await SessionStorage.updateLectureFields(session.id, {
+    status: 'transcribing',
+    error: null
+  });
 
   let previousTail = '';
   const totalChunks = session.chunks.length;
 
   for (let i = 0; i < totalChunks; i++) {
-    session = SessionStorage.getSession(sessionId);
+    session = await SessionStorage.getSession(session.id);
     const chunk = session.chunks[i];
 
-    // If this chunk was already transcribed in an earlier run, reuse its transcript and rolling tail!
     if (chunk.status === 'completed' && chunk.transcriptText) {
-      previousTail = getRollingTail(chunk.transcriptText);
-      if (onEvent) {
-        onEvent({
-          type: 'chunk_completed',
-          chunkIndex: chunk.index,
-          totalChunks,
-          skippedCached: true,
-          chunk,
-          message: `Chunk ${i + 1}/${totalChunks} (${chunk.startFormatted} – ${chunk.endFormatted}) already stored on disk.`
-        });
+      const checkCached = detectTranscriptHallucination(chunk.transcriptText);
+      if (!checkCached.isHallucinated) {
+        previousTail = getRollingTail(chunk.transcriptText);
+        if (onEvent) {
+          onEvent({
+            type: 'chunk_completed',
+            chunkIndex: chunk.index,
+            totalChunks,
+            skippedCached: true,
+            chunk,
+            message: `Chunk ${chunk.code} (${chunk.startFormatted} – ${chunk.endFormatted}) already stored in PostgreSQL.`
+          });
+        }
+        continue;
       }
-      continue;
     }
 
     const chunkFilePath = path.join(chunksDir, chunk.fileName);
@@ -247,54 +297,60 @@ export async function transcribeSessionChunks(sessionId, onEvent = null) {
       throw new Error(`Chunk audio file missing on disk: ${chunkFilePath}`);
     }
 
-    chunk.status = 'transcribing';
-    session.statusMessage = `Transcribing chunk ${i + 1} of ${totalChunks} (${chunk.startFormatted} – ${chunk.endFormatted})...`;
-    SessionStorage.saveSession(session);
+    const statusMsg = `Transcribing ${chunk.code} — Chunk ${i + 1} of ${totalChunks} (${chunk.startFormatted} – ${chunk.endFormatted}) with ${CONFIG.defaultChunkModel}...`;
+    await SessionStorage.markChunkStatus(session.id, chunk.index, 'transcribing', statusMsg);
 
     if (onEvent) {
       onEvent({
         type: 'chunk_started',
         chunkIndex: chunk.index,
+        chunkCode: chunk.code,
         totalChunks,
         startFormatted: chunk.startFormatted,
         endFormatted: chunk.endFormatted,
-        message: session.statusMessage
+        message: statusMsg
       });
     }
 
-    const { transcriptText, modelUsed } = await transcribeSingleChunk({
+    const { transcriptText, modelUsed, autoRetried } = await transcribeSingleChunk({
       chunkFilePath,
       chunk,
       totalChunks,
+      lectureCode: session.code,
+      subjectName: session.subjectName,
       title: session.title,
       topic: session.topic,
       previousTail,
-      onStatus: (rateLimitMsg) => {
+      preferredModel: CONFIG.defaultChunkModel,
+      forceGuardrails: false,
+      enhanceAudio: false,
+      onStatus: (statusUpdateMsg) => {
         if (onEvent) {
           onEvent({
             type: 'rate_limit_wait',
             chunkIndex: chunk.index,
-            message: rateLimitMsg
+            message: statusUpdateMsg
           });
         }
       }
     });
 
-    // Save chunk transcript to disk immediately!
-    session = SessionStorage.saveChunkTranscript(sessionId, chunk.index, transcriptText, modelUsed);
+    session = await SessionStorage.saveChunkTranscript(session.id, chunk.index, transcriptText, modelUsed);
     previousTail = getRollingTail(transcriptText);
 
     if (onEvent) {
       onEvent({
         type: 'chunk_completed',
         chunkIndex: chunk.index,
+        chunkCode: chunk.code,
         totalChunks,
         chunk: session.chunks[i],
+        autoRetried,
         fullTranscriptWords: session.fullTranscriptWords,
-        message: `Stored Chunk ${i + 1}/${totalChunks} (${session.chunks[i].wordCount} words)`
+        message: `Stored ${chunk.code} in PostgreSQL (${session.chunks[i].wordCount} words via ${modelUsed})`
       });
     }
   }
 
-  return SessionStorage.getSession(sessionId);
+  return await SessionStorage.getSession(session.id);
 }

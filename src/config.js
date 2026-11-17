@@ -6,8 +6,6 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 export const ROOT_DIR = path.resolve(__dirname, '..');
 
-// Load .env manually so running with `node src/server.js` always works
-// even without passing `--env-file=.env`
 function loadEnvFile() {
   const envPath = path.join(ROOT_DIR, '.env');
   if (!fs.existsSync(envPath)) return;
@@ -30,24 +28,65 @@ function loadEnvFile() {
 
 loadEnvFile();
 
+export function parsePgConfig() {
+  if (process.env.PGHOST && process.env.PGUSER && process.env.PGPASSWORD) {
+    return {
+      host: process.env.PGHOST,
+      port: Number(process.env.PGPORT || 5432),
+      user: process.env.PGUSER,
+      password: process.env.PGPASSWORD,
+      database: process.env.PGDATABASE || 'postgres'
+    };
+  }
+
+  const rawUrl = process.env.DATABASE_URL || '';
+  if (!rawUrl) {
+    return {
+      host: 'localhost',
+      port: 5432,
+      user: 'postgres',
+      password: '',
+      database: 'postgres'
+    };
+  }
+
+  const match = rawUrl.match(/^postgres(?:ql)?:\/\/(.+)@([^:/]+)(?::(\d+))?\/([^?]+)$/i);
+  if (match) {
+    const creds = match[1];
+    const host = match[2];
+    const port = Number(match[3] || 5432);
+    const database = match[4];
+    const colonIdx = creds.indexOf(':');
+    const user = colonIdx !== -1 ? decodeURIComponent(creds.slice(0, colonIdx)) : decodeURIComponent(creds);
+    const password = colonIdx !== -1 ? decodeURIComponent(creds.slice(colonIdx + 1)) : '';
+    return { host, port, user, password, database };
+  }
+
+  return { connectionString: rawUrl };
+}
+
 export const CONFIG = {
   port: Number(process.env.PORT || 3456),
-  // Active Free Tier API Key (never uses GEMINI_API_KEY_PAID unless explicitly requested)
+  // Paid Tier Primary API Key + Optional Fallback Key
   geminiApiKey: process.env.GEMINI_API_KEY || '',
-  // Ordered list of Gemini models to try (starts with highest-quality Flash model available on Free Tier)
-  geminiModels: [
-    'gemini-2.5-flash',
-    'gemini-2.0-flash',
-    'gemini-1.5-flash'
+  geminiApiKeyFallback: process.env.GEMINI_API_KEY_FREE || process.env.GEMINI_API_KEY_PAID || '',
+  // Default lightweight model for standard chunk processing
+  defaultChunkModel: 'gemini-2.5-flash',
+  // Heavy reasoning model used ONLY when a single chunk hallucinates or is manually reprocessed
+  retryHeavyModel: 'gemini-2.5-pro',
+  geminiModels: ['gemini-2.5-flash', 'gemini-2.0-flash'],
+  availableTranscriberModels: [
+    { id: 'gemini-2.5-pro', label: 'Gemini 2.5 Pro (Deep Accuracy / Anti-Hallucination)' },
+    { id: 'gemini-2.5-flash', label: 'Gemini 2.5 Flash (Fast Standard + Guardrails)' },
+    { id: 'gemini-2.0-flash', label: 'Gemini 2.0 Flash (Alternative Fast Model)' }
   ],
-  // Chunking configuration for 40-45 min lecture recordings
-  chunkTargetSec: Number(process.env.CHUNK_TARGET_SEC || 300), // 5 minutes per chunk
-  chunkSearchWindowBeforeSec: 35, // look up to 35s before target for a clean silence
-  chunkSearchWindowAfterSec: 25,  // look up to 25s after target for a clean silence
-  chunkFallbackOverlapSec: 4,     // if no silence exists in window, overlap by 4s so no word is cut
-  // Free Tier pacing (15 RPM limit => ~4.2 seconds minimum spacing between requests)
-  freeTierMinIntervalMs: Number(process.env.FREE_TIER_INTERVAL_MS || 4200),
-  // Supported input audio/video extensions
+  pg: parsePgConfig(),
+  chunkTargetSec: Number(process.env.CHUNK_TARGET_SEC || 300),
+  chunkSearchWindowBeforeSec: 35,
+  chunkSearchWindowAfterSec: 25,
+  chunkFallbackOverlapSec: 4,
+  // Paid tier needs no artificial 4.2s sleep—just a tiny 250ms courtesy burst spacing
+  apiMinIntervalMs: Number(process.env.API_MIN_INTERVAL_MS || 250),
   supportedExtensions: new Set([
     '.mp3',
     '.aac',
@@ -67,6 +106,5 @@ export const CONFIG = {
   tempDir: path.join(ROOT_DIR, 'data', 'temp')
 };
 
-// Ensure data directories exist
 fs.mkdirSync(CONFIG.sessionsDir, { recursive: true });
 fs.mkdirSync(CONFIG.tempDir, { recursive: true });

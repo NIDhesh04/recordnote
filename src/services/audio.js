@@ -32,8 +32,40 @@ function runProcess(command, args) {
 }
 
 /**
- * Probes an audio file using ffprobe to get duration and format info.
+ * Parses a timestamp string ("MM:SS", "HH:MM:SS", or numeric seconds) into seconds.
+ * Returns null if empty or invalid.
  */
+export function parseTimestampToSeconds(input) {
+  if (input === null || input === undefined) return null;
+  const str = String(input).trim();
+  if (!str) return null;
+
+  if (/^\d+(\.\d+)?$/.test(str)) {
+    const val = parseFloat(str);
+    return val >= 0 ? val : null;
+  }
+
+  const parts = str.split(':').map((p) => p.trim());
+  if (parts.some((p) => !/^\d+(\.\d+)?$/.test(p))) {
+    throw new Error(`Invalid timestamp format "${str}". Use MM:SS or HH:MM:SS (e.g., 05:30 or 00:42:15).`);
+  }
+
+  if (parts.length === 2) {
+    const mins = parseInt(parts[0], 10);
+    const secs = parseFloat(parts[1]);
+    return mins * 60 + secs;
+  }
+
+  if (parts.length === 3) {
+    const hrs = parseInt(parts[0], 10);
+    const mins = parseInt(parts[1], 10);
+    const secs = parseFloat(parts[2]);
+    return hrs * 3600 + mins * 60 + secs;
+  }
+
+  throw new Error(`Invalid timestamp format "${str}". Use MM:SS or HH:MM:SS.`);
+}
+
 export async function probeAudioFile(filePath) {
   const { stdout } = await runProcess('ffprobe', [
     '-v',
@@ -59,31 +91,67 @@ export async function probeAudioFile(filePath) {
 }
 
 /**
- * Converts any input audio/video (.mp3, .aac, .m4a, .wav, .ogg, .webm, .mp4)
- * into a speech-optimized 16kHz Mono 64kbps MP3 for consistent silence detection and fast API calls.
+ * Converts and optionally trims any input audio/video (.mp3, .aac, .m4a, .wav, .ogg, .webm, .mp4)
+ * into a speech-optimized 16kHz Mono 64kbps MP3.
+ * If trimStartSec / trimEndSec are provided, ONLY that time window is extracted into outputPath,
+ * and the raw inputPath is immediately deleted so unwanted audio is never stored on disk.
  */
-export async function normalizeAudioToSpeechMp3(inputPath, outputPath) {
+export async function normalizeAudioToSpeechMp3(
+  inputPath,
+  outputPath,
+  { trimStartSec = null, trimEndSec = null, deleteOriginal = true } = {}
+) {
   fs.mkdirSync(path.dirname(outputPath), { recursive: true });
-  await runProcess('ffmpeg', [
-    '-y',
+
+  const startSec = trimStartSec !== null && trimStartSec !== undefined && Number(trimStartSec) > 0
+    ? Number(trimStartSec)
+    : null;
+  const endSec = trimEndSec !== null && trimEndSec !== undefined && Number(trimEndSec) > 0
+    ? Number(trimEndSec)
+    : null;
+
+  if (startSec !== null && endSec !== null && endSec <= startSec) {
+    throw new Error(
+      `End timestamp (${formatSeconds(endSec)}) must be greater than Start timestamp (${formatSeconds(startSec)}).`
+    );
+  }
+
+  const args = ['-y'];
+  if (startSec !== null) {
+    args.push('-ss', String(startSec));
+  }
+  if (endSec !== null) {
+    args.push('-to', String(endSec));
+  }
+
+  args.push(
     '-i',
     inputPath,
-    '-vn', // strip any video track
+    '-vn',
     '-ac',
-    '1', // mono
+    '1',
     '-ar',
-    '16000', // 16kHz speech sample rate
+    '16000',
     '-b:a',
-    '64k', // 64kbps (high clarity for voice, ~480KB per minute)
+    '64k',
     outputPath
-  ]);
+  );
+
+  await runProcess('ffmpeg', args);
+
+  // Immediately delete the raw uploaded/downloaded source file so anything outside
+  // [trimStartSec, trimEndSec] is completely discarded and never stored anywhere.
+  if (deleteOriginal && path.resolve(inputPath) !== path.resolve(outputPath) && fs.existsSync(inputPath)) {
+    try {
+      fs.unlinkSync(inputPath);
+    } catch {
+      // ignore if already removed
+    }
+  }
+
   return probeAudioFile(outputPath);
 }
 
-/**
- * Scans a normalized audio file for natural pauses/silences using ffmpeg silencedetect.
- * Returns an array of silence midpoints (in seconds).
- */
 export async function detectSilenceMidpoints(audioPath) {
   const { stderr } = await runProcess('ffmpeg', [
     '-i',
@@ -102,10 +170,10 @@ export async function detectSilenceMidpoints(audioPath) {
 
   let m;
   while ((m = startRegex.exec(stderr)) !== null) {
-    starts.push( parseFloat(m[1]) );
+    starts.push(parseFloat(m[1]));
   }
   while ((m = endRegex.exec(stderr)) !== null) {
-    ends.push( parseFloat(m[1]) );
+    ends.push(parseFloat(m[1]));
   }
 
   const midpoints = [];
@@ -118,11 +186,6 @@ export async function detectSilenceMidpoints(audioPath) {
   return midpoints;
 }
 
-/**
- * Computes optimal chunk boundaries for a lecture recording.
- * Prefers splitting on a natural silence near the target chunk duration (default 300s / 5m).
- * If no silence is found in the search window, overlaps by `chunkFallbackOverlapSec` so no word is cut.
- */
 export function computeSmartChunkBoundaries(
   totalDurationSec,
   silenceMidpoints = [],
@@ -150,7 +213,6 @@ export function computeSmartChunkBoundaries(
 
   while (currentStart < totalDurationSec) {
     const remaining = totalDurationSec - currentStart;
-    // If remaining audio is within 1 chunk + small buffer, keep it as the final chunk
     if (remaining <= targetSec + windowAfter) {
       chunks.push({
         index,
@@ -166,7 +228,6 @@ export function computeSmartChunkBoundaries(
     const minWindow = Math.max(currentStart + minChunkLen, idealSplit - windowBefore);
     const maxWindow = Math.min(totalDurationSec - minChunkLen, idealSplit + windowAfter);
 
-    // Find silence midpoint closest to idealSplit within [minWindow, maxWindow]
     let bestSilence = null;
     let bestDist = Infinity;
     for (const mp of silenceMidpoints) {
@@ -190,7 +251,6 @@ export function computeSmartChunkBoundaries(
       });
       currentStart = endSec;
     } else {
-      // No natural pause found in window; split at idealSplit and step back by overlap for next chunk
       const endSec = Number(idealSplit.toFixed(2));
       chunks.push({
         index,
@@ -210,24 +270,43 @@ export function computeSmartChunkBoundaries(
 
 /**
  * Full audio preparation pipeline:
- * 1. Normalizes input (.mp3, .aac, .m4a, .wav, etc.) to 16kHz mono speech MP3
- * 2. Detects silences
- * 3. Slices audio into smart ~5-minute chunk MP3s in `chunksDir`
+ * 1. Extracts ONLY [trimStartSec, trimEndSec] (if specified) into normalized.mp3 and deletes raw source
+ * 2. Detects silences in the trimmed audio
+ * 3. Slices into smart ~5-minute chunk MP3s in `chunksDir`
  */
-export async function prepareAndChunkAudio(inputFilePath, sessionDir, targetChunkSec = CONFIG.chunkTargetSec, onProgress = null) {
+export async function prepareAndChunkAudio(
+  inputFilePath,
+  sessionDir,
+  targetChunkSec = CONFIG.chunkTargetSec,
+  onProgress = null,
+  { trimStartSec = null, trimEndSec = null, deleteOriginal = true } = {}
+) {
   const normalizedPath = path.join(sessionDir, 'source', 'normalized.mp3');
   const chunksDir = path.join(sessionDir, 'chunks');
   fs.mkdirSync(chunksDir, { recursive: true });
 
+  const hasTrim = (trimStartSec !== null && trimStartSec > 0) || (trimEndSec !== null && trimEndSec > 0);
   if (onProgress) {
-    onProgress({ stage: 'normalizing', message: 'Normalizing audio (.mp3/.aac → 16kHz Mono speech stream)...' });
+    const trimLabel = hasTrim
+      ? ` (Extracting only ${formatSeconds(trimStartSec || 0)} to ${
+          trimEndSec ? formatSeconds(trimEndSec) : 'end'
+        } & discarding rest)`
+      : '';
+    onProgress({
+      stage: 'normalizing',
+      message: `Normalizing audio stream${trimLabel}...`
+    });
   }
 
-  const normalizedMeta = await normalizeAudioToSpeechMp3(inputFilePath, normalizedPath);
+  const normalizedMeta = await normalizeAudioToSpeechMp3(inputFilePath, normalizedPath, {
+    trimStartSec,
+    trimEndSec,
+    deleteOriginal
+  });
   const totalDurationSec = normalizedMeta.durationSec;
 
   if (totalDurationSec <= 0) {
-    throw new Error('Audio file appears to be empty or has 0 duration.');
+    throw new Error('Selected audio segment is empty or has 0 duration. Check your Start/End timestamps.');
   }
 
   if (onProgress) {
@@ -239,6 +318,7 @@ export async function prepareAndChunkAudio(inputFilePath, sessionDir, targetChun
 
   const silenceMidpoints = await detectSilenceMidpoints(normalizedPath);
   const boundaries = computeSmartChunkBoundaries(totalDurationSec, silenceMidpoints, targetChunkSec);
+  const offsetSec = Number(trimStartSec || 0);
 
   const chunkManifest = [];
 
@@ -246,12 +326,17 @@ export async function prepareAndChunkAudio(inputFilePath, sessionDir, targetChun
     const chunkFileName = `chunk_${String(b.index).padStart(3, '0')}.mp3`;
     const chunkFilePath = path.join(chunksDir, chunkFileName);
 
+    const displayStartSec = Number((offsetSec + b.startTimeSec).toFixed(2));
+    const displayEndSec = Number((offsetSec + b.endTimeSec).toFixed(2));
+
     if (onProgress) {
       onProgress({
         stage: 'splitting',
         chunkIndex: b.index,
         totalChunks: boundaries.length,
-        message: `Extracting chunk ${b.index + 1}/${boundaries.length} (${formatSeconds(b.startTimeSec)} – ${formatSeconds(b.endTimeSec)})...`
+        message: `Extracting chunk ${b.index + 1}/${boundaries.length} (${formatSeconds(
+          displayStartSec
+        )} – ${formatSeconds(displayEndSec)})...`
       });
     }
 
@@ -271,11 +356,11 @@ export async function prepareAndChunkAudio(inputFilePath, sessionDir, targetChun
     chunkManifest.push({
       index: b.index,
       fileName: chunkFileName,
-      startTimeSec: b.startTimeSec,
-      endTimeSec: b.endTimeSec,
+      startTimeSec: displayStartSec,
+      endTimeSec: displayEndSec,
       durationSec: b.durationSec,
-      startFormatted: formatSeconds(b.startTimeSec),
-      endFormatted: formatSeconds(b.endTimeSec),
+      startFormatted: formatSeconds(displayStartSec),
+      endFormatted: formatSeconds(displayEndSec),
       splitOnSilence: b.splitOnSilence,
       status: 'pending',
       transcriptText: '',
@@ -286,7 +371,33 @@ export async function prepareAndChunkAudio(inputFilePath, sessionDir, targetChun
   }
 
   return {
+    normalizedPath,
     audioMetadata: normalizedMeta,
     chunks: chunkManifest
   };
+}
+
+/**
+ * Applies an FFmpeg speech-enhancement filter chain to a single chunk audio file:
+ * - highpass=f=120 (strips low-frequency AC/room hum & mic rumble that trigger "hmm" loops)
+ * - lowpass=f=7500 (strips high-frequency hiss)
+ * - dynaudnorm=f=150:g=15 (boosts quiet or distant lecturer speech)
+ */
+export async function enhanceChunkAudioForRetry(inputChunkPath, outputEnhancedPath) {
+  fs.mkdirSync(path.dirname(outputEnhancedPath), { recursive: true });
+  await runProcess('ffmpeg', [
+    '-y',
+    '-i',
+    inputChunkPath,
+    '-af',
+    'highpass=f=120,lowpass=f=7500,dynaudnorm=f=150:g=15',
+    '-ac',
+    '1',
+    '-ar',
+    '16000',
+    '-b:a',
+    '64k',
+    outputEnhancedPath
+  ]);
+  return outputEnhancedPath;
 }
